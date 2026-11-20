@@ -1,0 +1,2 @@
+-- NBU IoT Platform uses Alembic to create and upgrade its PostgreSQL schema.
+-- Keep this file available for the existing PostgreSQL compose mount; migrations run in the app container.

@@ -1,0 +1,33 @@
+services:
+  nbu-iot-platform:
+    build: .
+    container_name: nbu-iot-platform
+    restart: unless-stopped
+    environment:
+      APP_NAME: ${APP_NAME:-NBU IoT Platform}
+      APP_ENV: ${APP_ENV:-development}
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env}
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+      ACCESS_TOKEN_MINUTES: ${ACCESS_TOKEN_MINUTES:-60}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8000}
+      EMQX_BASE_URL: ${EMQX_BASE_URL:-http://emqx:18083}
+      EMQX_USERNAME: ${EMQX_USERNAME:-admin}
+      EMQX_PASSWORD: ${EMQX_PASSWORD:-${EMQX_DASHBOARD_PASSWORD:-}}
+      EMQX_TIMEOUT_SECONDS: ${EMQX_TIMEOUT_SECONDS:-8}
+      EMQX_MQTT_HOST: ${EMQX_MQTT_HOST:-emqx}
+      EMQX_MQTT_PORT: ${EMQX_MQTT_PORT:-1883}
+      EMQX_MQTT_PUBLIC_HOST: ${EMQX_MQTT_PUBLIC_HOST:-}
+      EMQX_MQTT_PUBLIC_PORT: ${EMQX_MQTT_PUBLIC_PORT:-1883}
+      EMQX_MQTT_PUBLIC_TLS_PORT: ${EMQX_MQTT_PUBLIC_TLS_PORT:-8883}
+      EMQX_MQTT_TLS_ENABLED: ${EMQX_MQTT_TLS_ENABLED:-false}
+      MQTT_KEEPALIVE_SECONDS: ${MQTT_KEEPALIVE_SECONDS:-60}
+      DEVICE_HEARTBEAT_TIMEOUT_SECONDS: ${DEVICE_HEARTBEAT_TIMEOUT_SECONDS:-90}
+      DEVICE_EVENT_WEBHOOK_URL: ${DEVICE_EVENT_WEBHOOK_URL:-http://nbu-iot-platform:8000}
+    ports:
+      - "8000:8000"
+    networks:
+      - iot_default
+
+networks:
+  iot_default:
+    external: true
