@@ -100,8 +100,6 @@ function updateMqttModeSelection(useTls, portOverride = null) {
   if (!mqttInfo) return;
   const configuredPort = Number(useTls ? (mqttInfo.tls_port || 8883) : (mqttInfo.plain_port || 1883));
   const port = Number.isInteger(Number(portOverride)) && Number(portOverride) > 0 ? Number(portOverride) : configuredPort;
-  mqttInfo.tls_enabled = useTls;
-  mqttInfo.port = port;
   const panel = deviceQuery('#device-detail');
   if (!panel) return;
   panel.querySelectorAll('[data-mqtt-mode]').forEach((option) => {
@@ -124,7 +122,7 @@ function updateMqttModeSelection(useTls, portOverride = null) {
 }
 
 function syncMqttModeWithOnlineDevice(device) {
-  if (device.id !== deviceState.selectedId || device.status !== 'online' || typeof device.last_connection_tls !== 'boolean') return;
+  if (device.id !== deviceState.selectedId || typeof device.last_connection_tls !== 'boolean') return;
   const port = Number(device.last_connection_port);
   if (Number.isInteger(port) && port > 0) updateMqttModeSelection(device.last_connection_tls, port);
 }
@@ -213,13 +211,11 @@ function renderDeviceDetail() {
   const projectDevicesPrefix = deviceState.organizationSlug + '/' + deviceState.projectSlug + '/';
   const topicPrefix = projectDevicesPrefix + device.topic_name + '/' + device.client_id + '/';
   const mqttInfo = deviceState.mqttConnectionInfo || { host: location.hostname, port: 1883, plain_port: 1883, tls_port: 8883, tls_enabled: false, host_is_configured: false, mqtt_version_recommended: '3.1.1', keepalive_seconds_recommended: 60 };
-  const hasLiveConnectionMode = device.status === 'online' && typeof device.last_connection_tls === 'boolean' && Number(device.last_connection_port) > 0;
-  const mqttModeTls = hasLiveConnectionMode ? device.last_connection_tls : Boolean(mqttInfo.tls_enabled);
-  const mqttModePort = hasLiveConnectionMode ? Number(device.last_connection_port) : Number(mqttInfo.port || (mqttModeTls ? mqttInfo.tls_port : mqttInfo.plain_port));
-  if (hasLiveConnectionMode) {
-    mqttInfo.tls_enabled = mqttModeTls;
-    mqttInfo.port = mqttModePort;
-  }
+  const hasKnownConnectionMode = typeof device.last_connection_tls === 'boolean' && Number(device.last_connection_port) > 0;
+  const mqttModeTls = hasKnownConnectionMode ? device.last_connection_tls : Boolean(mqttInfo.tls_enabled);
+  const mqttModePort = hasKnownConnectionMode ? Number(device.last_connection_port) : Number(mqttInfo.port || (mqttModeTls ? mqttInfo.tls_port : mqttInfo.plain_port));
+  const plainModePort = !mqttModeTls ? mqttModePort : Number(mqttInfo.plain_port || 1883);
+  const tlsModePort = mqttModeTls ? mqttModePort : Number(mqttInfo.tls_port || 8883);
   const topics = device.topics.map((rule) => {
     const actionLabel = ({ publish: 'ส่งข้อมูล · Publish', subscribe: 'รับข้อมูล · Subscribe', all: 'ส่งและรับ · Publish & Subscribe' })[rule.action] || rule.action;
     return '<tr><td><span class="action-tag ' + escapeDeviceHtml(rule.action) + '">' + escapeDeviceHtml(actionLabel) + '</span></td><td><code>' + escapeDeviceHtml(rule.topic) + '</code><small>QoS ' + escapeDeviceHtml(rule.qos.join(', ')) + ' · Retain ' + escapeDeviceHtml(rule.retain) + '</small></td><td><div class="topic-row-actions"><button type="button" class="secondary copy-icon-button" data-copy-topic="' + escapeDeviceHtml(rule.topic) + '" aria-label="คัดลอก Topic" title="คัดลอก Topic">' + copyIconMarkup + '</button><button type="button" class="icon-danger" data-remove-topic="' + rule.id + '" aria-label="ลบ ACL" title="ลบ ACL">×</button></div></td></tr>';
@@ -228,11 +224,11 @@ function renderDeviceDetail() {
     '<section id="device-live-summary" class="device-live-summary"><div class="presence-summary-item"><small>MQTT Session</small><span class="device-status ' + escapeDeviceHtml(device.status) + '" data-device-status><i></i>' + statusLabel(device.status) + '</span><span class="presence-detail"><span data-connection-port-label>' + (device.status === 'online' ? 'พอร์ตที่ใช้งาน' : 'พอร์ตที่ใช้ล่าสุด') + '</span><b data-connection-port>' + connectionPortLabel(device) + '</b></span></div><div class="presence-summary-item"><small>Heartbeat</small><span class="heartbeat-chip ' + escapeDeviceHtml(device.heartbeat_status || 'waiting') + '" data-heartbeat-status><i></i>' + heartbeatLabel(device.heartbeat_status) + '</span><span class="presence-detail">ล่าสุด <b data-heartbeat-time>' + (device.last_heartbeat_at ? formatDeviceDate(device.last_heartbeat_at) : 'ยังไม่เคยได้รับ heartbeat') + '</b></span></div><div class="presence-summary-item"><small>พบอุปกรณ์ล่าสุด</small><strong data-last-seen>' + (device.last_seen_at ? formatDeviceDate(device.last_seen_at) : 'ยังไม่มีข้อมูล') + '</strong></div></section>' +
     '<form id="device-name-form" class="device-name-form"><label>ชื่ออุปกรณ์<input name="name" value="' + escapeDeviceHtml(device.name) + '" minlength="2" maxlength="160" required></label><button class="secondary" type="submit">บันทึกชื่อ</button></form>' +
     '<section class="mqtt-connection-card"><header class="mqtt-connection-header"><span class="mqtt-connection-icon">⌁</span><div><h4>ข้อมูลเชื่อมต่อ MQTT</h4><p>ค่าที่ต้องใช้ตั้งค่า MQTT client ในอุปกรณ์</p></div></header>' +
-    '<div class="mqtt-connection-mode" role="group" aria-label="รูปแบบการเชื่อมต่อ MQTT"><button type="button" data-mqtt-mode="plain" aria-pressed="' + (!mqttModeTls) + '" class="' + (!mqttModeTls ? 'selected' : '') + '"><strong>ไม่ใช้ SSL/TLS</strong><small data-mqtt-mode-port>Port ' + escapeDeviceHtml(!mqttModeTls ? mqttModePort : (mqttInfo.plain_port || 1883)) + '</small></button><button type="button" data-mqtt-mode="tls" aria-pressed="' + Boolean(mqttModeTls) + '" class="' + (mqttModeTls ? 'selected' : '') + '"><strong>ใช้ SSL/TLS</strong><small data-mqtt-mode-port>Port ' + escapeDeviceHtml(mqttModeTls ? mqttModePort : (mqttInfo.tls_port || 8883)) + '</small></button></div>' +
+    '<div class="mqtt-connection-mode" role="group" aria-label="รูปแบบการเชื่อมต่อ MQTT"><button type="button" data-mqtt-mode="plain" aria-pressed="' + (!mqttModeTls) + '" class="' + (!mqttModeTls ? 'selected' : '') + '"><strong>ไม่ใช้ SSL/TLS</strong><small data-mqtt-mode-port>Port ' + escapeDeviceHtml(plainModePort) + '</small></button><button type="button" data-mqtt-mode="tls" aria-pressed="' + Boolean(mqttModeTls) + '" class="' + (mqttModeTls ? 'selected' : '') + '"><strong>ใช้ SSL/TLS</strong><small data-mqtt-mode-port>Port ' + escapeDeviceHtml(tlsModePort) + '</small></button></div>' +
     '<p class="mqtt-mode-note">เลือกค่าให้ตรงกับ listener ที่เปิดใช้งานบน EMQX; SSL/TLS ต้องมี listener และ certificate พร้อมใช้งาน</p>' +
     '<div class="mqtt-connection-grid"><div class="mqtt-connection-item"><small>Broker Host</small><div><code>' + escapeDeviceHtml(mqttInfo.host || 'ยังไม่ได้กำหนด') + '</code><button type="button" class="secondary copy-icon-button" data-copy-value="' + escapeDeviceHtml(mqttInfo.host || '') + '" aria-label="คัดลอก Broker Host" title="คัดลอก Broker Host">' + copyIconMarkup + '</button></div></div>' +
-    '<div class="mqtt-connection-item"><small>Port</small><div><code data-mqtt-port>' + escapeDeviceHtml(mqttInfo.port) + '</code><button type="button" class="secondary copy-icon-button" data-mqtt-port-copy data-copy-value="' + escapeDeviceHtml(mqttInfo.port) + '" aria-label="คัดลอก Port" title="คัดลอก Port">' + copyIconMarkup + '</button></div></div>' +
-    '<div class="mqtt-connection-item"><small>การเข้ารหัส</small><div><span class="mqtt-value-chip ' + (mqttInfo.tls_enabled ? 'secure' : '') + '" data-mqtt-encryption>' + (mqttInfo.tls_enabled ? 'SSL/TLS' : 'ไม่ใช้ SSL/TLS') + '</span></div></div>' +
+    '<div class="mqtt-connection-item"><small>Port</small><div><code data-mqtt-port>' + escapeDeviceHtml(mqttModePort) + '</code><button type="button" class="secondary copy-icon-button" data-mqtt-port-copy data-copy-value="' + escapeDeviceHtml(mqttModePort) + '" aria-label="คัดลอก Port" title="คัดลอก Port">' + copyIconMarkup + '</button></div></div>' +
+    '<div class="mqtt-connection-item"><small>การเข้ารหัส</small><div><span class="mqtt-value-chip ' + (mqttModeTls ? 'secure' : '') + '" data-mqtt-encryption>' + (mqttModeTls ? 'SSL/TLS' : 'ไม่ใช้ SSL/TLS') + '</span></div></div>' +
     '<div class="mqtt-connection-item"><small>MQTT Version แนะนำ</small><div><span class="mqtt-value-chip">' + escapeDeviceHtml(mqttInfo.mqtt_version_recommended || '3.1.1') + '</span></div></div>' +
     '<div class="mqtt-connection-item"><small>Client ID</small><div><code>' + escapeDeviceHtml(device.client_id) + '</code><button type="button" class="secondary copy-icon-button" data-copy-client aria-label="คัดลอก Client ID" title="คัดลอก Client ID">' + copyIconMarkup + '</button></div></div>' +
     '<div class="mqtt-connection-item"><small>Username</small><div><code>' + escapeDeviceHtml(device.client_id) + '</code><button type="button" class="secondary copy-icon-button" data-copy-value="' + escapeDeviceHtml(device.client_id) + '" aria-label="คัดลอก Username" title="คัดลอก Username">' + copyIconMarkup + '</button></div></div></div>' +
