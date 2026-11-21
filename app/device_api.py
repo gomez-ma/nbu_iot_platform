@@ -19,7 +19,7 @@ from app.device_presence import device_event_secret, heartbeat_state, parse_even
 from app.emqx import EMQXError, get_emqx
 from app.models import Device, DeviceTopic, Organization, OrganizationMember, Project, User
 from app.schemas import DeviceCreate, DeviceCredentialView, DeviceTopicCreate, DeviceTopicView, DeviceUpdate, DeviceView
-from app.security import decode_access_token, hash_password
+from app.security import decode_access_token_with_version, hash_password
 
 router = APIRouter(prefix="/api/v1")
 
@@ -193,6 +193,8 @@ def status_event_data(device: Device, status: str | None = None, list_changed: b
 
 
 def accessible_project_ids(db: Session, user: User) -> list[int]:
+    if user.is_platform_admin or user.is_platform_auditor:
+        return list(db.scalars(select(Project.id).order_by(Project.id)).all())
     project_ids = []
     memberships = db.scalars(select(OrganizationMember).where(OrganizationMember.user_id == user.id)).all()
     for membership in memberships:
@@ -287,7 +289,7 @@ async def device_status_events(
     if credentials is None:
         raise HTTPException(status_code=401, detail="Authentication required", headers={"WWW-Authenticate": "Bearer"})
     try:
-        user_id = decode_access_token(credentials.credentials)
+        user_id, token_version = decode_access_token_with_version(credentials.credentials)
     except Exception as exc:
         raise HTTPException(status_code=401, detail="Invalid or expired access token", headers={"WWW-Authenticate": "Bearer"}) from exc
 
@@ -295,7 +297,7 @@ async def device_status_events(
     try:
         with SessionLocal() as db:
             user = db.get(User, user_id)
-            if user is None or not user.is_active:
+            if user is None or not user.is_active or user.token_version != token_version:
                 raise HTTPException(status_code=401, detail="User account is unavailable")
             require_project_access(db, user, organization_id, project_id, "devices:read")
             subscriber = device_event_hub.subscribe(project_id)
@@ -332,7 +334,7 @@ async def online_device_events(credentials=Depends(bearer)):
     if credentials is None:
         raise HTTPException(status_code=401, detail="Authentication required", headers={"WWW-Authenticate": "Bearer"})
     try:
-        user_id = decode_access_token(credentials.credentials)
+        user_id, token_version = decode_access_token_with_version(credentials.credentials)
     except Exception as exc:
         raise HTTPException(status_code=401, detail="Invalid or expired access token", headers={"WWW-Authenticate": "Bearer"}) from exc
 
@@ -340,7 +342,7 @@ async def online_device_events(credentials=Depends(bearer)):
     try:
         with SessionLocal() as db:
             user = db.get(User, user_id)
-            if user is None or not user.is_active:
+            if user is None or not user.is_active or user.token_version != token_version:
                 raise HTTPException(status_code=401, detail="User account is unavailable")
             project_ids = accessible_project_ids(db, user)
             subscribers = [(project_id, device_event_hub.subscribe(project_id, connection_only=True)) for project_id in project_ids]

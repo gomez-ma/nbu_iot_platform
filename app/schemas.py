@@ -21,6 +21,7 @@ class UserView(BaseModel):
     email: EmailStr
     full_name: str
     is_platform_admin: bool
+    is_platform_auditor: bool = False
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -30,6 +31,7 @@ class PlatformUserView(BaseModel):
     full_name: str
     is_active: bool
     is_platform_admin: bool
+    is_platform_auditor: bool = False
     created_at: datetime
     model_config = ConfigDict(from_attributes=True)
 
@@ -41,6 +43,18 @@ class PlatformUsersPage(BaseModel):
 
 class UserActivationUpdate(BaseModel):
     is_active: bool
+
+
+class PlatformAuditorUpdate(BaseModel):
+    is_platform_auditor: bool
+
+
+class PlatformAdminUpdate(BaseModel):
+    is_platform_admin: bool
+
+
+class PlatformSettingsUpdate(BaseModel):
+    registration_enabled: bool
 
 
 class PlatformUserCreate(BaseModel):

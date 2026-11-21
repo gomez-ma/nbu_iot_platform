@@ -15,6 +15,8 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_platform_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_platform_auditor: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    token_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     memberships: Mapped[list["OrganizationMember"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     project_memberships: Mapped[list["ProjectMember"]] = relationship(back_populates="user", cascade="all, delete-orphan")
@@ -135,5 +137,25 @@ class DeviceTopic(Base):
     qos: Mapped[list[int]] = mapped_column(JSON, default=lambda: [0, 1, 2])
     retain: Mapped[str] = mapped_column(String(8), default="all")
     device: Mapped[Device] = relationship(back_populates="topics")
+
+
+class PlatformSettings(Base):
+    __tablename__ = "platform_settings"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    registration_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class AdminAuditLog(Base):
+    __tablename__ = "admin_audit_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    actor_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    actor_email: Mapped[str] = mapped_column(String(320))
+    action: Mapped[str] = mapped_column(String(80), index=True)
+    target_type: Mapped[str] = mapped_column(String(40))
+    target_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    details: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 

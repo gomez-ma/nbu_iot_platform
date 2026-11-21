@@ -1,14 +1,16 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.database import get_db
+from app.config import get_settings
 from app.emqx import EMQXError, get_emqx
-from app.models import Device, Organization, OrganizationMember, Permission, Project, ProjectMember, Role, User
-from app.schemas import AddMember, AddProjectMember, LoginRequest, MemberView, OrganizationCreate, OrganizationUpdate, OrganizationView, PasswordChange, PlatformUserCreate, PlatformUserUpdate, PlatformUserView, PlatformUsersPage, ProfileUpdate, ProjectCreate, ProjectMemberView, ProjectMembersView, ProjectUpdate, ProjectView, TokenView, UpdateMemberRole, UpdateProjectMemberRole, UserActivationUpdate, UserCreate, UserView
-from app.security import create_access_token, decode_access_token, hash_password, verify_password
+from app.models import AdminAuditLog, Device, Organization, OrganizationMember, Permission, PlatformSettings, Project, ProjectMember, Role, User
+from app.device_presence import heartbeat_state
+from app.schemas import AddMember, AddProjectMember, LoginRequest, MemberView, OrganizationCreate, OrganizationUpdate, OrganizationView, PasswordChange, PlatformAdminUpdate, PlatformAuditorUpdate, PlatformSettingsUpdate, PlatformUserCreate, PlatformUserUpdate, PlatformUserView, PlatformUsersPage, ProfileUpdate, ProjectCreate, ProjectMemberView, ProjectMembersView, ProjectUpdate, ProjectView, TokenView, UpdateMemberRole, UpdateProjectMemberRole, UserActivationUpdate, UserCreate, UserView
+from app.security import create_access_token, decode_access_token_with_version, hash_password, verify_password
 
 router = APIRouter(prefix="/api/v1")
 bearer = HTTPBearer(auto_error=False)
@@ -71,15 +73,24 @@ def require_platform_admin(user: User) -> None:
         raise HTTPException(status_code=403, detail="สิทธิ์นี้สำหรับผู้ดูแลระบบเท่านั้น")
 
 
+def require_platform_reader(user: User) -> None:
+    if not (user.is_platform_admin or user.is_platform_auditor):
+        raise HTTPException(status_code=403, detail="สิทธิ์นี้สำหรับผู้ดูแลหรือผู้ตรวจสอบระบบเท่านั้น")
+
+
+def add_admin_audit(db: Session, actor: User, action: str, target_type: str, target_id: int | str | None = None, details: dict | None = None) -> None:
+    db.add(AdminAuditLog(actor_id=actor.id, actor_email=actor.email, action=action, target_type=target_type, target_id=str(target_id) if target_id is not None else None, details=details or {}))
+
+
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer), db: Session = Depends(get_db)) -> User:
     if credentials is None:
         raise HTTPException(status_code=401, detail="Authentication required", headers={"WWW-Authenticate": "Bearer"})
     try:
-        user_id = decode_access_token(credentials.credentials)
+        user_id, token_version = decode_access_token_with_version(credentials.credentials)
     except Exception as exc:
         raise HTTPException(status_code=401, detail="Invalid or expired access token", headers={"WWW-Authenticate": "Bearer"}) from exc
     user = db.get(User, user_id)
-    if not user or not user.is_active:
+    if not user or not user.is_active or user.token_version != token_version:
         raise HTTPException(status_code=401, detail="User account is unavailable")
     return user
 
@@ -97,6 +108,8 @@ def require_project_access(db: Session, user: User, organization_id: int, projec
     project = db.scalar(select(Project).where(Project.id == project_id, Project.organization_id == organization_id))
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
+    if (user.is_platform_admin or user.is_platform_auditor) and permission in {"organizations:read", "projects:read", "devices:read"}:
+        return project
     organization_member = require_org(db, user, organization_id, "organizations:read")
     if organization_member.role.name in {"owner", "organization_admin"}:
         if permission not in {p.key for p in organization_member.role.permissions}:
@@ -141,15 +154,30 @@ def synchronize_device_topic_namespaces(devices: list[Device]) -> None:
 
 
 def can_manage_project_members(db: Session, user: User, organization_id: int, project_id: int) -> bool:
-    organization_member = require_org(db, user, organization_id, "organizations:read")
+    if user.is_platform_auditor:
+        return False
+    organization_member = db.get(OrganizationMember, (organization_id, user.id))
+    if organization_member is None:
+        return False
+    if "organizations:read" not in {p.key for p in organization_member.role.permissions}:
+        return False
     if organization_member.role.name in {"owner", "organization_admin"}:
         return True
     project_member = db.get(ProjectMember, (project_id, user.id))
     return bool(project_member and project_member.role.name in {"project_owner", "project_admin"})
 
 
+@router.get("/auth/registration-status")
+def registration_status(db: Session = Depends(get_db)):
+    settings = db.get(PlatformSettings, 1)
+    return {"enabled": settings.registration_enabled if settings else True}
+
+
 @router.post("/auth/register", status_code=201)
 def register(data: UserCreate, db: Session = Depends(get_db)):
+    settings = db.get(PlatformSettings, 1)
+    if settings is not None and not settings.registration_enabled:
+        raise HTTPException(status_code=403, detail="การสมัครสมาชิกถูกปิดชั่วคราว กรุณาติดต่อผู้ดูแลระบบ")
     normalized_email = data.email.lower()
     if db.scalar(select(User).where(User.email == normalized_email)):
         raise HTTPException(status_code=409, detail="An account with this email already exists")
@@ -161,7 +189,7 @@ def register(data: UserCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(user)
     if is_first_account:
-        return TokenView(access_token=create_access_token(user.id), user=user)
+        return TokenView(access_token=create_access_token(user.id, user.token_version), user=user)
     return {"pending_approval": True, "message": "สมัครสมาชิกสำเร็จ บัญชีอยู่ระหว่างรอผู้ดูแลระบบตรวจสอบและเปิดใช้งาน"}
 
 
@@ -172,7 +200,7 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=401, detail="Email or password is incorrect")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="บัญชีถูกระงับหรือกำลังรอผู้ดูแลระบบตรวจสอบและเปิดใช้งาน")
-    return TokenView(access_token=create_access_token(user.id), user=user)
+    return TokenView(access_token=create_access_token(user.id, user.token_version), user=user)
 
 
 @router.get("/auth/me", response_model=UserView)
@@ -200,7 +228,7 @@ def change_password(data: PasswordChange, db: Session = Depends(get_db), user: U
 
 @router.get("/admin/users", response_model=PlatformUsersPage)
 def list_platform_users(q: str = "", limit: int = 50, offset: int = 0, db: Session = Depends(get_db), user: User = Depends(current_user)):
-    require_platform_admin(user)
+    require_platform_reader(user)
     limit = max(1, min(limit, 100))
     offset = max(0, offset)
     query = select(User)
@@ -212,11 +240,270 @@ def list_platform_users(q: str = "", limit: int = 50, offset: int = 0, db: Sessi
     return PlatformUsersPage(items=items, total=total)
 
 
+@router.get("/admin/overview")
+def platform_overview(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    require_platform_reader(user)
+    counts = {
+        "users": db.scalar(select(func.count()).select_from(User)) or 0,
+        "active_users": db.scalar(select(func.count()).select_from(User).where(User.is_active.is_(True))) or 0,
+        "inactive_users": db.scalar(select(func.count()).select_from(User).where(User.is_active.is_(False))) or 0,
+        "organizations": db.scalar(select(func.count()).select_from(Organization)) or 0,
+        "projects": db.scalar(select(func.count()).select_from(Project)) or 0,
+        "devices": db.scalar(select(func.count()).select_from(Device)) or 0,
+        "online_devices": db.scalar(select(func.count()).select_from(Device).where(Device.is_active.is_(True), Device.broker_connected.is_(True))) or 0,
+    }
+    try:
+        db.execute(select(1))
+        database_status = "ok"
+    except Exception:
+        database_status = "error"
+    try:
+        # EMQX /status responds with plain text, while EmqxClient.request expects
+        # JSON. /nodes is an authenticated JSON endpoint and works as a health probe.
+        get_emqx().request("GET", "/api/v5/nodes")
+        emqx_status = "ok"
+    except Exception:
+        emqx_status = "error"
+    return {**counts, "database_status": database_status, "emqx_status": emqx_status}
+
+
+@router.get("/admin/search")
+def platform_search(q: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    require_platform_reader(user)
+    term = q.strip()
+    if len(term) < 2:
+        raise HTTPException(status_code=422, detail="กรุณาค้นหาอย่างน้อย 2 ตัวอักษร")
+    pattern = f"%{term}%"
+    users = db.scalars(select(User).where(User.full_name.ilike(pattern) | User.email.ilike(pattern)).order_by(User.full_name).limit(8)).all()
+    organizations = db.scalars(select(Organization).where(Organization.name.ilike(pattern) | Organization.slug.ilike(pattern)).order_by(Organization.name).limit(8)).all()
+    projects = db.execute(
+        select(Project, Organization.name, Organization.slug)
+        .join(Organization, Organization.id == Project.organization_id)
+        .where(Project.name.ilike(pattern) | Project.slug.ilike(pattern) | Organization.name.ilike(pattern))
+        .order_by(Project.name).limit(8)
+    ).all()
+    devices = db.execute(
+        select(Device, Project.name, Organization.name, Organization.slug, Project.slug)
+        .join(Project, Project.id == Device.project_id)
+        .join(Organization, Organization.id == Project.organization_id)
+        .where(Device.name.ilike(pattern) | Device.client_id.ilike(pattern) | Project.name.ilike(pattern) | Organization.name.ilike(pattern))
+        .order_by(Device.name).limit(8)
+    ).all()
+    return {
+        "users": [{"id": item.id, "name": item.full_name, "email": item.email, "active": item.is_active} for item in users],
+        "organizations": [{"id": item.id, "name": item.name, "slug": item.slug} for item in organizations],
+        "projects": [{"id": project.id, "name": project.name, "slug": project.slug, "organization_name": org_name, "organization_slug": org_slug} for project, org_name, org_slug in projects],
+        "devices": [{"id": item.id, "name": item.name, "client_id": item.client_id, "status": "online" if item.is_active and item.broker_connected else "offline", "project_name": project_name, "organization_name": org_name, "organization_slug": org_slug, "project_slug": project_slug} for item, project_name, org_name, org_slug, project_slug in devices],
+    }
+
+
+@router.get("/admin/device-diagnostics")
+def list_device_diagnostics(
+    q: str = "", status: str = "all", organization_id: int | None = None,
+    project_id: int | None = None, limit: int = 25, offset: int = 0,
+    db: Session = Depends(get_db), user: User = Depends(current_user),
+):
+    require_platform_reader(user)
+    if status not in {"all", "online", "offline"}:
+        raise HTTPException(status_code=422, detail="สถานะตัวกรองไม่ถูกต้อง")
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+    filters = []
+    if q.strip():
+        pattern = f"%{q.strip()}%"
+        filters.append(or_(Device.name.ilike(pattern), Device.client_id.ilike(pattern), Project.name.ilike(pattern), Organization.name.ilike(pattern)))
+    if organization_id is not None:
+        filters.append(Organization.id == organization_id)
+    if project_id is not None:
+        filters.append(Project.id == project_id)
+    if status == "online":
+        filters.extend([Device.is_active.is_(True), Device.broker_connected.is_(True)])
+    elif status == "offline":
+        filters.append(or_(Device.is_active.is_(False), Device.broker_connected.is_(False)))
+
+    joins = select(Device, Project, Organization).join(Project, Project.id == Device.project_id).join(Organization, Organization.id == Project.organization_id)
+    total = db.scalar(select(func.count()).select_from(Device).join(Project, Project.id == Device.project_id).join(Organization, Organization.id == Project.organization_id).where(*filters)) or 0
+    rows = db.execute(joins.where(*filters).order_by(Organization.name, Project.name, Device.name).offset(offset).limit(limit)).all()
+    devices = [device for device, _, _ in rows]
+    try:
+        live_sessions = get_emqx().connected_client_details([device.client_id for device in devices])
+        emqx_status = "ok"
+    except EMQXError:
+        live_sessions = None
+        emqx_status = "error"
+
+    settings = get_settings()
+    items = []
+    for device, project, organization in rows:
+        heartbeat = heartbeat_state(device.last_heartbeat_at, settings.device_heartbeat_timeout_seconds)
+        broker_status = "unknown" if live_sessions is None else "online" if device.is_active and device.client_id in live_sessions else "offline"
+        if not device.is_active:
+            diagnosis = "อุปกรณ์ถูกปิดใช้งานในระบบ"
+        elif broker_status == "unknown":
+            recorded = "ออนไลน์" if device.broker_connected else "ออฟไลน์"
+            diagnosis = f"ตรวจสถานะ EMQX ไม่ได้ · ระบบบันทึกล่าสุดว่า{recorded}"
+        elif broker_status == "online" and heartbeat == "active":
+            diagnosis = "การเชื่อมต่อ MQTT และ heartbeat ปกติ"
+        elif broker_status == "online" and heartbeat == "stale":
+            diagnosis = f"เชื่อมต่อ MQTT อยู่ แต่ heartbeat เกิน {settings.device_heartbeat_timeout_seconds} วินาที"
+        elif broker_status == "online":
+            diagnosis = "เชื่อมต่อ MQTT อยู่ แต่ยังไม่เคยได้รับ heartbeat"
+        elif heartbeat == "active":
+            diagnosis = "ออฟไลน์จาก EMQX แต่เพิ่งได้รับ heartbeat · ตรวจการตัดการเชื่อมต่อ"
+        else:
+            diagnosis = "ออฟไลน์จาก EMQX · ตรวจไฟเลี้ยง เครือข่าย และการตั้งค่า MQTT"
+        tls = device.last_connection_tls
+        if tls is None and device.last_connection_port is not None:
+            if device.last_connection_port == settings.emqx_mqtt_public_tls_port:
+                tls = True
+            elif device.last_connection_port in {settings.emqx_mqtt_public_port, settings.emqx_mqtt_port}:
+                tls = False
+        last_seen = device.last_seen_at or device.last_heartbeat_at or (device.connection_event_at if device.broker_connected else None)
+        items.append({
+            "id": device.id, "name": device.name, "client_id": device.client_id,
+            "is_active": device.is_active, "broker_status": broker_status,
+            "recorded_broker_status": "online" if device.is_active and device.broker_connected else "offline",
+            "heartbeat_status": heartbeat, "heartbeat_timeout_seconds": settings.device_heartbeat_timeout_seconds,
+            "last_connection_port": device.last_connection_port, "last_connection_tls": tls,
+            "connection_event_at": device.connection_event_at, "last_seen_at": last_seen,
+            "last_heartbeat_at": device.last_heartbeat_at, "diagnosis": diagnosis,
+            "organization_id": organization.id, "organization_name": organization.name,
+            "project_id": project.id, "project_name": project.name,
+        })
+    organizations = db.execute(select(Organization.id, Organization.name).order_by(Organization.name)).all()
+    projects = db.execute(select(Project.id, Project.name, Project.organization_id, Organization.name).join(Organization, Organization.id == Project.organization_id).order_by(Organization.name, Project.name)).all()
+    return {
+        "total": total, "emqx_status": emqx_status, "items": items,
+        "organizations": [{"id": item.id, "name": item.name} for item in organizations],
+        "projects": [{"id": item.id, "name": item.name, "organization_id": item.organization_id, "organization_name": item[3]} for item in projects],
+    }
+
+
+@router.get("/admin/settings")
+def get_platform_settings(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    require_platform_reader(user)
+    settings = db.get(PlatformSettings, 1)
+    return {"registration_enabled": settings.registration_enabled if settings else True}
+
+
+@router.patch("/admin/settings")
+def update_platform_settings(data: PlatformSettingsUpdate, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    require_platform_admin(user)
+    settings = db.get(PlatformSettings, 1)
+    if settings is None:
+        settings = PlatformSettings(id=1, registration_enabled=data.registration_enabled)
+        db.add(settings)
+    else:
+        settings.registration_enabled = data.registration_enabled
+    add_admin_audit(db, user, "platform.registration.updated", "platform_settings", 1, {"registration_enabled": data.registration_enabled})
+    db.commit()
+    return {"registration_enabled": settings.registration_enabled}
+
+
+@router.get("/admin/audit-logs")
+def list_admin_audit_logs(limit: int = 50, offset: int = 0, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    require_platform_reader(user)
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+    total = db.scalar(select(func.count()).select_from(AdminAuditLog)) or 0
+    entries = db.scalars(select(AdminAuditLog).order_by(AdminAuditLog.created_at.desc(), AdminAuditLog.id.desc()).offset(offset).limit(limit)).all()
+    user_ids = {int(item.target_id) for item in entries if item.target_type == "user" and item.target_id and item.target_id.isdigit()}
+    device_ids = {int(item.target_id) for item in entries if item.target_type == "device" and item.target_id and item.target_id.isdigit()}
+    users_by_id = {item.id: item for item in db.scalars(select(User).where(User.id.in_(user_ids))).all()} if user_ids else {}
+    devices_by_id = {item.id: item for item in db.scalars(select(Device).where(Device.id.in_(device_ids))).all()} if device_ids else {}
+    target_labels = {"platform_settings:1": "การรับสมัครสมาชิก"}
+    target_labels.update({f"user:{item.id}": f"บัญชีผู้ใช้: {item.full_name} · {item.email}" for item in users_by_id.values()})
+    target_labels.update({f"device:{item.id}": f"อุปกรณ์: {item.name} · {item.client_id}" for item in devices_by_id.values()})
+    items = []
+    for item in entries:
+        target_label = target_labels.get(f"{item.target_type}:{item.target_id}")
+        if target_label is None and item.target_type == "user":
+            target_label = f"บัญชีผู้ใช้: {item.details.get('email', 'บัญชีที่ถูกลบ')}" if item.details.get("email") else "บัญชีผู้ใช้"
+        if target_label is None and item.target_type == "device":
+            target_label = f"อุปกรณ์: {item.details.get('client_id', 'ไม่ทราบ Client ID')}"
+        items.append({"id": item.id, "actor_email": item.actor_email, "action": item.action, "target_type": item.target_type, "target_id": item.target_id, "target_label": target_label or item.target_type, "details": item.details, "created_at": item.created_at})
+    return {"total": total, "items": items}
+
+
+@router.patch("/admin/users/{user_id}/auditor", response_model=PlatformUserView)
+def update_platform_auditor(user_id: int, data: PlatformAuditorUpdate, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    require_platform_admin(user)
+    target = db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="ไม่พบบัญชีผู้ใช้")
+    if target.is_platform_admin:
+        raise HTTPException(status_code=400, detail="บัญชีผู้ดูแลระบบเต็มรูปแบบไม่สามารถตั้งเป็นผู้ตรวจสอบได้")
+    target.is_platform_auditor = data.is_platform_auditor
+    target.token_version += 1
+    add_admin_audit(db, user, "user.auditor.updated", "user", target.id, {"is_platform_auditor": data.is_platform_auditor})
+    db.commit()
+    db.refresh(target)
+    return target
+
+
+@router.patch("/admin/users/{user_id}/admin", response_model=PlatformUserView)
+def update_platform_admin(user_id: int, data: PlatformAdminUpdate, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    require_platform_admin(user)
+    target = db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="ไม่พบบัญชีผู้ใช้")
+    if target.id == user.id and not data.is_platform_admin:
+        raise HTTPException(status_code=400, detail="ไม่สามารถถอดสิทธิ์ผู้ดูแลระบบของบัญชีที่กำลังใช้งานอยู่ได้")
+    if target.is_platform_admin != data.is_platform_admin:
+        if not data.is_platform_admin:
+            other_admins = db.scalar(select(func.count()).select_from(User).where(User.is_platform_admin.is_(True), User.id != target.id)) or 0
+            if other_admins == 0:
+                raise HTTPException(status_code=400, detail="ต้องเหลือผู้ดูแลระบบอย่างน้อยหนึ่งบัญชี")
+            if target.is_active:
+                other_active_admins = db.scalar(select(func.count()).select_from(User).where(User.is_platform_admin.is_(True), User.is_active.is_(True), User.id != target.id)) or 0
+                if other_active_admins == 0:
+                    raise HTTPException(status_code=400, detail="ต้องเหลือผู้ดูแลระบบที่ใช้งานได้อย่างน้อยหนึ่งบัญชี")
+        target.is_platform_admin = data.is_platform_admin
+        if data.is_platform_admin:
+            target.is_platform_auditor = False
+        target.token_version += 1
+        add_admin_audit(db, user, "user.admin.updated", "user", target.id, {"is_platform_admin": data.is_platform_admin})
+        db.commit()
+        db.refresh(target)
+    return target
+
+
+@router.post("/admin/devices/{device_id}/retry-acl", status_code=204)
+def retry_device_acl_sync(device_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    require_platform_admin(user)
+    device = db.get(Device, device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="ไม่พบอุปกรณ์")
+    try:
+        broker = get_emqx()
+        broker.ensure_access_control()
+        broker.set_device_rules(device.client_id, [
+            {"topic": topic.topic, "action": topic.action, "permission": "allow", "qos": topic.qos, "retain": topic.retain}
+            for topic in device.topics
+        ])
+    except EMQXError as exc:
+        raise HTTPException(status_code=503, detail=f"ซิงก์ ACL กับ EMQX ไม่สำเร็จ: {exc}") from exc
+    add_admin_audit(db, user, "device.acl.retry", "device", device.id, {"client_id": device.client_id})
+    db.commit()
+
+
+@router.post("/admin/users/{user_id}/revoke-sessions", status_code=204)
+def revoke_user_sessions(user_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    require_platform_admin(user)
+    target = db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="ไม่พบบัญชีผู้ใช้")
+    target.token_version += 1
+    add_admin_audit(db, user, "user.sessions.revoked", "user", target.id)
+    db.commit()
+
+
 @router.post("/admin/users", response_model=PlatformUserView, status_code=201)
 def create_platform_user(data: PlatformUserCreate, db: Session = Depends(get_db), user: User = Depends(current_user)):
     require_platform_admin(user)
     target = User(email=data.email.lower(), full_name=data.full_name, password_hash=hash_password(data.password))
     db.add(target)
+    add_admin_audit(db, user, "user.created", "user", details={"email": target.email})
     try:
         db.commit()
         db.refresh(target)
@@ -238,6 +525,8 @@ def update_platform_user_details(user_id: int, data: PlatformUserUpdate, db: Ses
         target.email = data.email.lower()
     if data.password is not None:
         target.password_hash = hash_password(data.password)
+        target.token_version += 1
+    add_admin_audit(db, user, "user.updated", "user", target.id, {"fields": [field for field, value in data.model_dump(exclude_unset=True).items() if value is not None]})
     try:
         db.commit()
         db.refresh(target)
@@ -260,6 +549,9 @@ def update_platform_user_status(user_id: int, data: UserActivationUpdate, db: Se
         if active_admins <= 1:
             raise HTTPException(status_code=400, detail="ต้องมีผู้ดูแลระบบที่ใช้งานได้อย่างน้อยหนึ่งบัญชี")
     target.is_active = data.is_active
+    if not data.is_active:
+        target.token_version += 1
+    add_admin_audit(db, user, "user.status.updated", "user", target.id, {"is_active": data.is_active})
     db.commit()
     db.refresh(target)
     return target
@@ -287,6 +579,7 @@ def delete_platform_user(user_id: int, db: Session = Depends(get_db), user: User
         successor = next((member for member in other_members if member.role.name == "organization_admin"), other_members[0])
         successor.role_id = owner_role.id
     # Keep projects intact while removing their creator foreign-key dependency.
+    add_admin_audit(db, user, "user.deleted", "user", target.id, {"email": target.email})
     db.execute(update(Project).where(Project.created_by == target.id).values(created_by=user.id))
     db.delete(target)
     db.commit()
@@ -362,7 +655,11 @@ def update_organization(organization_id: int, data: OrganizationUpdate, db: Sess
 
 @router.get("/organizations/{organization_id}/members", response_model=list[MemberView])
 def list_members(organization_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
-    require_org(db, user, organization_id, "organizations:read")
+    if user.is_platform_admin or user.is_platform_auditor:
+        if db.get(Organization, organization_id) is None:
+            raise HTTPException(status_code=404, detail="Organization not found")
+    else:
+        require_org(db, user, organization_id, "organizations:read")
     members = db.scalars(select(OrganizationMember).where(OrganizationMember.organization_id == organization_id).order_by(OrganizationMember.user_id)).all()
     return [MemberView(user_id=m.user_id, email=m.user.email, full_name=m.user.full_name, role=m.role.name) for m in members]
 
@@ -427,6 +724,16 @@ def remove_member(organization_id: int, member_user_id: int, db: Session = Depen
 
 @router.get("/organizations/{organization_id}/projects", response_model=list[ProjectView])
 def list_projects(organization_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    if user.is_platform_auditor:
+        if db.get(Organization, organization_id) is None:
+            raise HTTPException(status_code=404, detail="Organization not found")
+        projects = db.scalars(select(Project).where(Project.organization_id == organization_id).order_by(Project.name)).all()
+        return [ProjectView.model_validate(project).model_copy(update={"can_manage": False}) for project in projects]
+    if user.is_platform_admin and db.get(OrganizationMember, (organization_id, user.id)) is None:
+        if db.get(Organization, organization_id) is None:
+            raise HTTPException(status_code=404, detail="Organization not found")
+        projects = db.scalars(select(Project).where(Project.organization_id == organization_id).order_by(Project.name)).all()
+        return [ProjectView.model_validate(project).model_copy(update={"can_manage": False}) for project in projects]
     membership = require_org(db, user, organization_id, "organizations:read")
     query = select(Project).where(Project.organization_id == organization_id)
     org_can_manage = membership.role.name in {"owner", "organization_admin"}
