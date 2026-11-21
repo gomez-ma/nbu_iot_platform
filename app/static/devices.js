@@ -123,7 +123,7 @@ function updateMqttModeSelection(device, useTls, portOverride = null) {
 }
 
 function syncMqttModeWithOnlineDevice(device) {
-  if (device.id !== deviceState.selectedId || typeof device.last_connection_tls !== 'boolean') return;
+  if (device.id !== deviceState.selectedId || device.status !== 'online' || typeof device.last_connection_tls !== 'boolean') return;
   const port = Number(device.last_connection_port);
   if (Number.isInteger(port) && port > 0) updateMqttModeSelection(device, device.last_connection_tls, port);
 }
@@ -213,9 +213,10 @@ function renderDeviceDetail() {
   const topicPrefix = projectDevicesPrefix + device.topic_name + '/' + device.client_id + '/';
   const mqttInfo = deviceState.mqttConnectionInfo || { host: location.hostname, port: 1883, plain_port: 1883, tls_port: 8883, tls_enabled: false, host_is_configured: false, mqtt_version_recommended: '3.1.1', keepalive_seconds_recommended: 60 };
   const hasKnownConnectionMode = typeof device.last_connection_tls === 'boolean' && Number(device.last_connection_port) > 0;
+  const hasLiveConnectionMode = device.status === 'online' && hasKnownConnectionMode;
   const selectedMode = deviceState.mqttModeByDevice.get(device.id);
-  const mqttModeTls = hasKnownConnectionMode ? device.last_connection_tls : (selectedMode?.tls ?? false);
-  const mqttModePort = hasKnownConnectionMode ? Number(device.last_connection_port) : Number(selectedMode?.port || mqttInfo.plain_port || 1883);
+  const mqttModeTls = hasLiveConnectionMode ? device.last_connection_tls : (selectedMode?.tls ?? (hasKnownConnectionMode ? device.last_connection_tls : false));
+  const mqttModePort = hasLiveConnectionMode ? Number(device.last_connection_port) : Number(selectedMode?.port || (hasKnownConnectionMode ? device.last_connection_port : mqttInfo.plain_port || 1883));
   const plainModePort = !mqttModeTls ? mqttModePort : Number(mqttInfo.plain_port || 1883);
   const tlsModePort = mqttModeTls ? mqttModePort : Number(mqttInfo.tls_port || 8883);
   const topics = device.topics.map((rule) => {
