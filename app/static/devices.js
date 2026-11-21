@@ -1,6 +1,6 @@
 const deviceApi = '/api/v1';
 const deviceTokenKey = 'nbu_iot_access_token';
-const deviceState = { organizationId: null, projectId: null, organizationSlug: '', projectSlug: '', mqttConnectionInfo: null, devices: [], selectedId: null, streamController: null, streamGeneration: 0, heartbeatStaleTimer: null, noticeTimer: null, copyFeedbackTimer: null, copyFeedbackButton: null, refreshInFlight: false };
+const deviceState = { organizationId: null, projectId: null, organizationSlug: '', projectSlug: '', mqttConnectionInfo: null, mqttModeByDevice: new Map(), devices: [], selectedId: null, streamController: null, streamGeneration: 0, heartbeatStaleTimer: null, noticeTimer: null, copyFeedbackTimer: null, copyFeedbackButton: null, refreshInFlight: false };
 const deviceQuery = (selector, root = document) => root.querySelector(selector);
 const escapeDeviceHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
 const copyIconMarkup = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>';
@@ -95,11 +95,12 @@ function connectionPortLabel(device) {
   return encryption + ' · Port ' + port;
 }
 
-function updateMqttModeSelection(useTls, portOverride = null) {
+function updateMqttModeSelection(device, useTls, portOverride = null) {
   const mqttInfo = deviceState.mqttConnectionInfo;
-  if (!mqttInfo) return;
+  if (!mqttInfo || !device) return;
   const configuredPort = Number(useTls ? (mqttInfo.tls_port || 8883) : (mqttInfo.plain_port || 1883));
   const port = Number.isInteger(Number(portOverride)) && Number(portOverride) > 0 ? Number(portOverride) : configuredPort;
+  deviceState.mqttModeByDevice.set(device.id, { tls: useTls, port });
   const panel = deviceQuery('#device-detail');
   if (!panel) return;
   panel.querySelectorAll('[data-mqtt-mode]').forEach((option) => {
@@ -124,7 +125,7 @@ function updateMqttModeSelection(useTls, portOverride = null) {
 function syncMqttModeWithOnlineDevice(device) {
   if (device.id !== deviceState.selectedId || typeof device.last_connection_tls !== 'boolean') return;
   const port = Number(device.last_connection_port);
-  if (Number.isInteger(port) && port > 0) updateMqttModeSelection(device.last_connection_tls, port);
+  if (Number.isInteger(port) && port > 0) updateMqttModeSelection(device, device.last_connection_tls, port);
 }
 
 function updateDevicePresenceSummary(device) {
@@ -212,8 +213,9 @@ function renderDeviceDetail() {
   const topicPrefix = projectDevicesPrefix + device.topic_name + '/' + device.client_id + '/';
   const mqttInfo = deviceState.mqttConnectionInfo || { host: location.hostname, port: 1883, plain_port: 1883, tls_port: 8883, tls_enabled: false, host_is_configured: false, mqtt_version_recommended: '3.1.1', keepalive_seconds_recommended: 60 };
   const hasKnownConnectionMode = typeof device.last_connection_tls === 'boolean' && Number(device.last_connection_port) > 0;
-  const mqttModeTls = hasKnownConnectionMode ? device.last_connection_tls : Boolean(mqttInfo.tls_enabled);
-  const mqttModePort = hasKnownConnectionMode ? Number(device.last_connection_port) : Number(mqttInfo.port || (mqttModeTls ? mqttInfo.tls_port : mqttInfo.plain_port));
+  const selectedMode = deviceState.mqttModeByDevice.get(device.id);
+  const mqttModeTls = hasKnownConnectionMode ? device.last_connection_tls : (selectedMode?.tls ?? false);
+  const mqttModePort = hasKnownConnectionMode ? Number(device.last_connection_port) : Number(selectedMode?.port || mqttInfo.plain_port || 1883);
   const plainModePort = !mqttModeTls ? mqttModePort : Number(mqttInfo.plain_port || 1883);
   const tlsModePort = mqttModeTls ? mqttModePort : Number(mqttInfo.tls_port || 8883);
   const topics = device.topics.map((rule) => {
@@ -242,7 +244,7 @@ function renderDeviceDetail() {
   panel.querySelector('#device-name-form').addEventListener('submit', updateDeviceName);
   panel.querySelector('#device-topic-form').addEventListener('submit', addDeviceTopic);
   panel.querySelectorAll('[data-mqtt-mode]').forEach((button) => button.addEventListener('click', () => {
-    updateMqttModeSelection(button.dataset.mqttMode === 'tls');
+    updateMqttModeSelection(device, button.dataset.mqttMode === 'tls');
   }));
   scheduleHeartbeatExpiry(device);
 }
