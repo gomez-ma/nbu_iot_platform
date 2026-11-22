@@ -1,19 +1,19 @@
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import case, delete, func, or_, select, update
+from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.database import get_db
 from app.config import get_settings
 from app.emqx import EMQXError, get_emqx
-from app.models import AdminAuditLog, BillingAccount, BillingPlan, BillingSubscription, Device, Organization, OrganizationMember, Permission, PlatformSettings, Project, ProjectMember, Role, User
+from app.models import AdminAuditLog, BillingAccount, BillingPlan, BillingSubscription, Device, DeviceTopic, Organization, OrganizationMember, Permission, PlatformSettings, Project, ProjectMember, Role, SupportSession, User
 from app.device_presence import heartbeat_state
-from app.schemas import AddMember, AddProjectMember, BillingPlanCreate, BillingPlanUpdate, BillingSubscriptionUpdate, LoginRequest, MemberView, OrganizationCreate, OrganizationUpdate, OrganizationView, PasswordChange, PlatformAdminUpdate, PlatformAuditorUpdate, PlatformSettingsUpdate, PlatformUserCreate, PlatformUserUpdate, PlatformUserView, PlatformUsersPage, ProfileUpdate, ProjectCreate, ProjectMemberView, ProjectMembersView, ProjectUpdate, ProjectView, TokenView, UpdateMemberRole, UpdateProjectMemberRole, UserActivationUpdate, UserCreate, UserView
-from app.security import create_access_token, decode_access_token_with_version, hash_password, verify_password
-from app.billing import account_for_organization, ensure_quota, get_or_create_owner_account, get_subscription, subscription_payload
+from app.schemas import AddMember, AddProjectMember, BillingPlanCreate, BillingPlanUpdate, BillingSubscriptionUpdate, LoginRequest, MemberView, OrganizationCreate, OrganizationUpdate, OrganizationView, PasswordChange, PlatformAdminUpdate, PlatformAuditorUpdate, PlatformSettingsUpdate, PlatformUserCreate, PlatformUserUpdate, PlatformUserView, PlatformUsersPage, ProfileUpdate, ProjectCreate, ProjectMemberView, ProjectMembersView, ProjectUpdate, ProjectView, SupportSessionCreate, TokenView, UpdateMemberRole, UpdateProjectMemberRole, UserActivationUpdate, UserCreate, UserView
+from app.security import create_access_token, create_support_access_token, decode_access_token_payload, hash_password, verify_password
+from app.billing import account_for_organization, effective_status as effective_subscription_status, ensure_quota, get_or_create_owner_account, get_subscription, resolved_limits, subscription_payload
 
 router = APIRouter(prefix="/api/v1")
 bearer = HTTPBearer(auto_error=False)
@@ -85,16 +85,37 @@ def add_admin_audit(db: Session, actor: User, action: str, target_type: str, tar
     db.add(AdminAuditLog(actor_id=actor.id, actor_email=actor.email, action=action, target_type=target_type, target_id=str(target_id) if target_id is not None else None, details=details or {}))
 
 
-def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer), db: Session = Depends(get_db)) -> User:
+def current_user(request: Request, credentials: HTTPAuthorizationCredentials | None = Depends(bearer), db: Session = Depends(get_db)) -> User:
     if credentials is None:
         raise HTTPException(status_code=401, detail="Authentication required", headers={"WWW-Authenticate": "Bearer"})
     try:
-        user_id, token_version = decode_access_token_with_version(credentials.credentials)
+        payload = decode_access_token_payload(credentials.credentials)
+        user_id, token_version = int(payload["sub"]), int(payload.get("ver", 0))
     except Exception as exc:
         raise HTTPException(status_code=401, detail="Invalid or expired access token", headers={"WWW-Authenticate": "Bearer"}) from exc
     user = db.get(User, user_id)
     if not user or not user.is_active or user.token_version != token_version:
         raise HTTPException(status_code=401, detail="User account is unavailable")
+    support_session_id = payload.get("support_session")
+    if support_session_id is not None:
+        try:
+            support_session = db.get(SupportSession, int(support_session_id))
+        except (TypeError, ValueError):
+            support_session = None
+        now = datetime.now(timezone.utc)
+        actor = db.get(User, support_session.actor_user_id) if support_session else None
+        if (support_session is None or support_session.ended_at is not None or support_session.expires_at <= now
+                or support_session.target_user_id != user.id or int(payload.get("support_actor", -1)) != support_session.actor_user_id
+                or actor is None or not actor.is_active or not actor.is_platform_admin
+                or int(payload.get("support_actor_ver", -1)) != actor.token_version):
+            raise HTTPException(status_code=401, detail="สิทธิ์เข้าช่วยเหลือหมดอายุหรือถูกยุติแล้ว")
+        request.state.support_session_id = support_session.id
+        account = db.get(BillingAccount, support_session.billing_account_id)
+        add_admin_audit(db, actor, "support.request", "billing_account", support_session.billing_account_id, {
+            "session_id": support_session.id, "target_user_id": user.id, "account_name": account.name if account else "บัญชีลูกค้า",
+            "method": request.method, "path": request.url.path,
+        })
+        db.commit()
     return user
 
 
@@ -220,7 +241,9 @@ def update_profile(data: ProfileUpdate, db: Session = Depends(get_db), user: Use
 
 
 @router.post("/auth/me/password", status_code=204)
-def change_password(data: PasswordChange, db: Session = Depends(get_db), user: User = Depends(current_user)):
+def change_password(data: PasswordChange, request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    if getattr(request.state, "support_session_id", None) is not None:
+        raise HTTPException(status_code=403, detail="ไม่สามารถเปลี่ยนรหัสผ่านลูกค้าระหว่างโหมดช่วยเหลือได้")
     if not verify_password(data.current_password, user.password_hash):
         raise HTTPException(status_code=400, detail="รหัสผ่านปัจจุบันไม่ถูกต้อง")
     if verify_password(data.new_password, user.password_hash):
@@ -470,28 +493,145 @@ def get_my_billing_usage(db: Session = Depends(get_db), user: User = Depends(cur
     return {"accounts": [subscription_payload(db, account) for account in accounts]}
 
 
+def billing_usage_for_accounts(db: Session, account_ids: list[int]) -> dict[int, dict[str, int]]:
+    usage = {account_id: {"max_organizations": 0, "max_projects": 0, "max_members": 0, "max_devices": 0, "max_topic_acls": 0} for account_id in account_ids}
+    if not account_ids:
+        return usage
+    queries = {
+        "max_organizations": select(Organization.billing_account_id, func.count(Organization.id)).where(Organization.billing_account_id.in_(account_ids)).group_by(Organization.billing_account_id),
+        "max_projects": select(Organization.billing_account_id, func.count(Project.id)).join(Project, Project.organization_id == Organization.id).where(Organization.billing_account_id.in_(account_ids)).group_by(Organization.billing_account_id),
+        "max_members": select(Organization.billing_account_id, func.count(func.distinct(OrganizationMember.user_id))).join(OrganizationMember, OrganizationMember.organization_id == Organization.id).where(Organization.billing_account_id.in_(account_ids)).group_by(Organization.billing_account_id),
+        "max_devices": select(Organization.billing_account_id, func.count(Device.id)).join(Project, Project.organization_id == Organization.id).join(Device, Device.project_id == Project.id).where(Organization.billing_account_id.in_(account_ids)).group_by(Organization.billing_account_id),
+        "max_topic_acls": select(Organization.billing_account_id, func.count(DeviceTopic.id)).join(Project, Project.organization_id == Organization.id).join(Device, Device.project_id == Project.id).join(DeviceTopic, DeviceTopic.device_id == Device.id).where(Organization.billing_account_id.in_(account_ids), DeviceTopic.is_system.is_(False)).group_by(Organization.billing_account_id),
+    }
+    for key, query in queries.items():
+        for account_id, count in db.execute(query).all():
+            usage[account_id][key] = count
+    return usage
+
+
 @router.get("/admin/billing/accounts")
-def list_billing_accounts(db: Session = Depends(get_db), user: User = Depends(current_user)):
+def list_billing_accounts(
+    page: int = 1, page_size: int = 20, search: str = "", status: str = "all",
+    db: Session = Depends(get_db), user: User = Depends(current_user),
+):
     require_platform_reader(user)
+    page = max(1, page)
+    page_size = max(1, min(page_size, 100))
+    search = search.strip()[:200]
+    allowed_statuses = {"all", "trial", "active", "grace", "expired", "suspended", "unassigned"}
+    if status not in allowed_statuses:
+        raise HTTPException(status_code=422, detail="สถานะบัญชีลูกค้าไม่ถูกต้อง")
+    now = datetime.now(timezone.utc)
+    active_statuses = BillingSubscription.status.in_(("active", "trial", "grace"))
+    effective_status = case(
+        (BillingSubscription.id.is_(None), "unassigned"),
+        (and_(active_statuses, BillingSubscription.ends_at.is_not(None), BillingSubscription.ends_at <= now, BillingSubscription.grace_until > now), "grace"),
+        (and_(active_statuses, BillingSubscription.ends_at.is_not(None), BillingSubscription.ends_at <= now), "expired"),
+        else_=BillingSubscription.status,
+    )
+    query = select(BillingAccount).join(User, User.id == BillingAccount.owner_user_id).outerjoin(BillingSubscription, BillingSubscription.billing_account_id == BillingAccount.id)
+    if search:
+        pattern = f"%{search}%"
+        query = query.where(or_(BillingAccount.name.ilike(pattern), User.full_name.ilike(pattern), User.email.ilike(pattern)))
+    if status != "all":
+        query = query.where(effective_status == status)
+    total = db.scalar(select(func.count()).select_from(query.order_by(None).subquery())) or 0
     accounts = db.scalars(
-        select(BillingAccount)
-        .options(selectinload(BillingAccount.owner), selectinload(BillingAccount.subscription).selectinload(BillingSubscription.plan))
+        query.options(selectinload(BillingAccount.owner), selectinload(BillingAccount.subscription).selectinload(BillingSubscription.plan))
         .order_by(BillingAccount.created_at.desc(), BillingAccount.id.desc())
-    ).all()
+        .offset((page - 1) * page_size).limit(page_size)
+    ).unique().all()
+    account_ids = [account.id for account in accounts]
+    usage_by_account = billing_usage_for_accounts(db, account_ids)
     results = []
     for account in accounts:
-        if account.subscription is None:
-            subscription = None
-        else:
-            subscription = subscription_payload(db, account)
+        sub = account.subscription
+        subscription = None if sub is None else {
+            "billing_account_id": account.id, "billing_account_name": account.name,
+            "plan_code": sub.plan.code, "plan_name": sub.plan.name, "plan_description": sub.plan.description,
+            "status": effective_subscription_status(sub, now), "starts_at": sub.starts_at, "ends_at": sub.ends_at,
+            "grace_until": sub.grace_until, "limits": resolved_limits(sub),
+            "quota_overrides": sub.quota_overrides or {}, "usage": usage_by_account[account.id],
+        }
         results.append({
-            "id": account.id, "name": account.name,
-            "owner_user_id": account.owner_user_id,
+            "id": account.id, "name": account.name, "owner_user_id": account.owner_user_id,
             "owner_name": account.owner.full_name, "owner_email": account.owner.email,
             "created_at": account.created_at, "subscription": subscription,
         })
+    summary_rows = db.execute(
+        select(effective_status, func.count(BillingAccount.id))
+        .select_from(BillingAccount).outerjoin(BillingSubscription, BillingSubscription.billing_account_id == BillingAccount.id)
+        .group_by(effective_status)
+    ).all()
+    summary = {"total": 0, "trial": 0, "active": 0, "inactive": 0}
+    for state, count in summary_rows:
+        summary["total"] += count
+        if state in {"trial", "active"}:
+            summary[state] += count
+        elif state in {"grace", "expired", "suspended"}:
+            summary["inactive"] += count
     plans = db.scalars(select(BillingPlan).where(BillingPlan.is_active.is_(True), BillingPlan.code != "legacy").order_by(BillingPlan.id)).all()
-    return {"accounts": results, "plans": [{"code": p.code, "name": p.name, "description": p.description, "duration_days": p.duration_days, "max_organizations": p.max_organizations, "max_projects": p.max_projects, "max_members": p.max_members, "max_devices": p.max_devices, "max_topic_acls": p.max_topic_acls} for p in plans]}
+    return {
+        "accounts": results, "total": total, "page": page, "page_size": page_size,
+        "pages": max(1, (total + page_size - 1) // page_size), "summary": summary,
+        "plans": [{"code": p.code, "name": p.name, "description": p.description, "duration_days": p.duration_days, "max_organizations": p.max_organizations, "max_projects": p.max_projects, "max_members": p.max_members, "max_devices": p.max_devices, "max_topic_acls": p.max_topic_acls} for p in plans],
+    }
+
+
+@router.post("/admin/billing/accounts/{account_id}/support-session")
+def start_customer_support(account_id: int, data: SupportSessionCreate, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    require_platform_admin(user)
+    account = db.scalar(select(BillingAccount).options(selectinload(BillingAccount.owner)).where(BillingAccount.id == account_id))
+    if account is None:
+        raise HTTPException(status_code=404, detail="ไม่พบบัญชีลูกค้า")
+    target = account.owner
+    if not target.is_active:
+        raise HTTPException(status_code=400, detail="บัญชีลูกค้าถูกระงับหรือยังไม่ได้เปิดใช้งาน")
+    if target.is_platform_admin or target.is_platform_auditor:
+        raise HTTPException(status_code=400, detail="ไม่สามารถเข้าช่วยเหลือบัญชีผู้ดูแลหรือผู้ตรวจสอบระบบได้")
+    reason = data.reason.strip()
+    if len(reason) < 10:
+        raise HTTPException(status_code=422, detail="กรุณาระบุเหตุผลอย่างน้อย 10 ตัวอักษร")
+    now = datetime.now(timezone.utc)
+    support_session = SupportSession(
+        actor_user_id=user.id, target_user_id=target.id, billing_account_id=account.id,
+        reason=reason, expires_at=now + timedelta(minutes=30),
+    )
+    db.add(support_session)
+    db.flush()
+    token = create_support_access_token(target.id, target.token_version, support_session.id, user.id, user.token_version, support_session.expires_at)
+    add_admin_audit(db, user, "support.session.started", "billing_account", account.id, {
+        "session_id": support_session.id, "target_user_id": target.id, "target_email": target.email,
+        "account_name": account.name, "reason": reason, "expires_at": support_session.expires_at.isoformat(),
+    })
+    db.commit()
+    return {"access_token": token, "expires_at": support_session.expires_at, "target": UserView.model_validate(target)}
+
+
+@router.get("/support/session")
+def get_support_session(request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    session_id = getattr(request.state, "support_session_id", None)
+    support_session = db.get(SupportSession, session_id) if session_id else None
+    actor = db.get(User, support_session.actor_user_id) if support_session else None
+    if support_session is None or actor is None:
+        raise HTTPException(status_code=404, detail="ไม่พบช่วงเวลาเข้าช่วยเหลือที่กำลังใช้งาน")
+    return {"reason": support_session.reason, "started_at": support_session.created_at, "expires_at": support_session.expires_at, "admin_name": actor.full_name}
+
+
+@router.post("/support/session/exit")
+def end_support_session(request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    session_id = getattr(request.state, "support_session_id", None)
+    support_session = db.get(SupportSession, session_id) if session_id else None
+    actor = db.get(User, support_session.actor_user_id) if support_session else None
+    if support_session is None or actor is None:
+        raise HTTPException(status_code=404, detail="ไม่พบช่วงเวลาเข้าช่วยเหลือที่กำลังใช้งาน")
+    support_session.ended_at = datetime.now(timezone.utc)
+    add_admin_audit(db, actor, "support.session.ended", "billing_account", support_session.billing_account_id, {
+        "session_id": support_session.id, "target_user_id": user.id, "account_name": db.get(BillingAccount, support_session.billing_account_id).name, "reason": support_session.reason,
+    })
+    db.commit()
+    return {"ended": True}
 
 
 @router.put("/admin/billing/accounts/{account_id}/subscription")
@@ -557,6 +697,8 @@ def list_admin_audit_logs(limit: int = 50, offset: int = 0, db: Session = Depend
             target_label = f"บัญชีผู้ใช้: {item.details.get('email', 'บัญชีที่ถูกลบ')}" if item.details.get("email") else "บัญชีผู้ใช้"
         if target_label is None and item.target_type == "device":
             target_label = f"อุปกรณ์: {item.details.get('client_id', 'ไม่ทราบ Client ID')}"
+        if target_label is None and item.target_type == "billing_account":
+            target_label = f"บัญชีลูกค้า: {item.details.get('account_name', 'ไม่ทราบชื่อบัญชี')}"
         items.append({"id": item.id, "actor_email": item.actor_email, "action": item.action, "target_type": item.target_type, "target_id": item.target_id, "target_label": target_label or item.target_type, "details": item.details, "created_at": item.created_at})
     return {"total": total, "items": items}
 

@@ -1,6 +1,6 @@
 const adminUsersState={page:1,pageSize:50,search:'',total:0,request:0,timer:null};
 const adminAuditState={page:1,pageSize:20,total:0,request:0};
-const adminBillingState={accounts:[],plans:[],request:0};
+const adminBillingState={accounts:[],plans:[],summary:{total:0,trial:0,active:0,inactive:0},page:1,pageSize:20,search:'',status:'all',total:0,pages:1,request:0,timer:null};
 const billingPlanState={plans:[],request:0};
 function adminRoleActionButton(item){
   const isAdmin=Boolean(item.is_platform_admin);const label=isAdmin?'ถอดสิทธิ์ผู้ดูแลระบบ':'กำหนดเป็นผู้ดูแลระบบ';
@@ -99,28 +99,27 @@ document.getElementById('billing-plan-form').addEventListener('submit',async eve
 function formatBillingDate(value){return value?new Date(value).toLocaleDateString('th-TH',{dateStyle:'medium'}):'ไม่กำหนดวันหมดอายุ';}
 function renderAdminBillingAccounts(){
   const root=document.getElementById('admin-billing-accounts');const canManage=Boolean(currentUser?.is_platform_admin);
-  const accounts=adminBillingState.accounts;const tally={total:accounts.length,trial:0,active:0,inactive:0};
-  for(const account of accounts){const status=account.subscription?.status||'unassigned';if(status==='trial')tally.trial++;if(status==='active')tally.active++;if(['grace','expired','suspended'].includes(status))tally.inactive++;}
+  const accounts=adminBillingState.accounts;const tally=adminBillingState.summary;
   document.getElementById('billing-accounts-total').textContent=tally.total.toLocaleString('th-TH');document.getElementById('billing-accounts-trial').textContent=tally.trial.toLocaleString('th-TH');document.getElementById('billing-accounts-active').textContent=tally.active.toLocaleString('th-TH');document.getElementById('billing-accounts-inactive').textContent=tally.inactive.toLocaleString('th-TH');
-  const query=(document.getElementById('billing-accounts-search').value||'').trim().toLocaleLowerCase();const statusFilter=document.getElementById('billing-accounts-status').value;
-  const visible=accounts.filter(account=>{const sub=account.subscription;const status=sub?.status||'unassigned';const matchesStatus=statusFilter==='all'||statusFilter===status;const searchable=[account.name,account.owner_name,account.owner_email,sub?.plan_name].filter(Boolean).join(' ').toLocaleLowerCase();return matchesStatus&&(!query||searchable.includes(query));});
-  document.getElementById('billing-accounts-result-count').textContent=`แสดง ${visible.length.toLocaleString('th-TH')} จาก ${accounts.length.toLocaleString('th-TH')} บัญชี`;
-  if(!accounts.length){root.innerHTML='<div class="billing-account-empty"><strong>ยังไม่มีบัญชีลูกค้า</strong><p>เมื่อมีผู้ใช้สร้างองค์กร ระบบจะสร้างบัญชีลูกค้าและกำหนดแพ็กเกจทดลองให้อัตโนมัติ</p></div>';return;}
-  if(!visible.length){root.innerHTML='<div class="billing-account-empty"><strong>ไม่พบบัญชีที่ตรงกับตัวกรอง</strong><p>ลองเปลี่ยนคำค้นหาหรือเลือกสถานะอื่น</p></div>';return;}
+  const first=adminBillingState.total?((adminBillingState.page-1)*adminBillingState.pageSize+1):0;const last=Math.min(adminBillingState.page*adminBillingState.pageSize,adminBillingState.total);
+  document.getElementById('billing-accounts-result-count').textContent=`แสดง ${first.toLocaleString('th-TH')}–${last.toLocaleString('th-TH')} จาก ${adminBillingState.total.toLocaleString('th-TH')} บัญชี`;
+  const pageLabel=document.getElementById('billing-accounts-page-label');pageLabel.textContent=`หน้า ${adminBillingState.page.toLocaleString('th-TH')}/${adminBillingState.pages.toLocaleString('th-TH')}`;
+  document.getElementById('billing-accounts-prev').disabled=adminBillingState.page<=1;document.getElementById('billing-accounts-next').disabled=adminBillingState.page>=adminBillingState.pages;
+  if(!accounts.length){root.innerHTML=adminBillingState.total===0&&adminBillingState.summary.total===0?'<div class="billing-account-empty"><strong>ยังไม่มีบัญชีลูกค้า</strong><p>เมื่อมีผู้ใช้สร้างองค์กร ระบบจะสร้างบัญชีลูกค้าและกำหนดแพ็กเกจทดลองให้อัตโนมัติ</p></div>':'<div class="billing-account-empty"><strong>ไม่พบบัญชีที่ตรงกับตัวกรอง</strong><p>ลองเปลี่ยนคำค้นหาหรือเลือกสถานะอื่น</p></div>';return;}
   const names={max_organizations:'องค์กร',max_projects:'โปรเจ็กต์',max_members:'สมาชิก',max_devices:'อุปกรณ์',max_topic_acls:'Topic ACL'};
-  root.innerHTML=visible.map(account=>{
+  root.innerHTML=accounts.map(account=>{
     const sub=account.subscription;
     const planOptions=adminBillingState.plans.map(plan=>`<option value="${escapeHtml(plan.code)}">${escapeHtml(plan.name)}</option>`).join('');
     const usage=sub?Object.keys(names).map(key=>{const used=Number(sub.usage[key]||0),limit=sub.limits[key];return `<span>${names[key]} <b>${used.toLocaleString('th-TH')}/${limit===null?'∞':Number(limit).toLocaleString('th-TH')}</b></span>`;}).join(''):'';
     const statusLabels={trial:'ทดลองใช้',active:'ใช้งาน',grace:'หมดอายุ · ผ่อนผัน',expired:'หมดอายุ',suspended:'ระงับ',unassigned:'ยังไม่มีแพ็กเกจ'};const status=sub?.status||'unassigned';
     const overrides=sub?.quota_overrides||{};
-    return `<article class="admin-billing-account"><div class="admin-billing-account-head"><div><strong>${escapeHtml(account.name)}</strong><small>${escapeHtml(account.owner_name)} · ${escapeHtml(account.owner_email)}</small></div><span class="billing-status ${escapeHtml(status)}">${escapeHtml(statusLabels[status])}</span></div><div class="admin-billing-current"><span>แพ็กเกจ <b>${escapeHtml(sub?.plan_name||'ยังไม่กำหนด')}</b></span><span>หมดอายุ <b>${formatBillingDate(sub?.ends_at)}</b></span>${usage||'<span>ยังไม่มีข้อมูลโควตา</span>'}</div>${canManage?`<details class="billing-account-manage"><summary>${sub?'เปลี่ยนแพ็กเกจ':'กำหนดแพ็กเกจ'}</summary><form class="admin-billing-form" data-account-id="${account.id}"><p class="billing-plan-change-note">ช่องโควตาที่กรอกจะใช้กับบัญชีนี้ ช่องว่างจะใช้ค่าของแพ็กเกจ การบันทึกจะเริ่มระยะเวลาใหม่</p><label>แพ็กเกจ<select name="plan_code" required><option value="" selected disabled>เลือกแพ็กเกจ</option>${planOptions}</select></label><label>อายุแพ็กเกจ (วัน)<input name="duration_days" type="number" min="1" max="3650" placeholder="ตามแพ็กเกจ"></label><label>ช่วงผ่อนผัน (วัน)<input name="grace_days" type="number" min="0" max="90" value="30" required></label><div class="admin-billing-overrides"><small>โควตาเฉพาะบัญชี · เว้นว่างใช้ค่าของแพ็กเกจ · 0 = ไม่อนุญาต · ค่าไม่จำกัดใช้ null</small><div>${Object.entries(names).map(([key,label])=>`<label>${label}<input name="${key}" type="number" min="0" placeholder="ตามแพ็กเกจ" value="${overrides[key]===undefined||overrides[key]===null?'':Number(overrides[key])}"></label>`).join('')}</div></div><p class="billing-form-error error" role="alert"></p><button class="primary" type="submit">ยืนยันการกำหนดแพ็กเกจ</button></form></details>`:''}</article>`;
+    return `<article class="admin-billing-account"><div class="admin-billing-account-head"><div><strong>${escapeHtml(account.name)}</strong><small>${escapeHtml(account.owner_name)} · ${escapeHtml(account.owner_email)}</small></div><span class="billing-status ${escapeHtml(status)}">${escapeHtml(statusLabels[status])}</span></div><div class="admin-billing-current"><span>แพ็กเกจ <b>${escapeHtml(sub?.plan_name||'ยังไม่กำหนด')}</b></span><span>หมดอายุ <b>${formatBillingDate(sub?.ends_at)}</b></span>${usage||'<span>ยังไม่มีข้อมูลโควตา</span>'}</div>${canManage?`<div class="billing-support-actions"><button type="button" class="secondary billing-support-start" data-account-id="${account.id}" data-account-name="${escapeHtml(account.name)}" data-owner-email="${escapeHtml(account.owner_email)}">เข้าช่วยเหลือ</button></div><details class="billing-account-manage"><summary>${sub?'เปลี่ยนแพ็กเกจ':'กำหนดแพ็กเกจ'}</summary><form class="admin-billing-form" data-account-id="${account.id}"><p class="billing-plan-change-note">ช่องโควตาที่กรอกจะใช้กับบัญชีนี้ ช่องว่างจะใช้ค่าของแพ็กเกจ การบันทึกจะเริ่มระยะเวลาใหม่</p><label>แพ็กเกจ<select name="plan_code" required><option value="" selected disabled>เลือกแพ็กเกจ</option>${planOptions}</select></label><label>อายุแพ็กเกจ (วัน)<input name="duration_days" type="number" min="1" max="3650" placeholder="ตามแพ็กเกจ"></label><label>ช่วงผ่อนผัน (วัน)<input name="grace_days" type="number" min="0" max="90" value="30" required></label><div class="admin-billing-overrides"><small>โควตาเฉพาะบัญชี · เว้นว่างใช้ค่าของแพ็กเกจ · 0 = ไม่อนุญาต · ค่าไม่จำกัดใช้ null</small><div>${Object.entries(names).map(([key,label])=>`<label>${label}<input name="${key}" type="number" min="0" placeholder="ตามแพ็กเกจ" value="${overrides[key]===undefined||overrides[key]===null?'':Number(overrides[key])}"></label>`).join('')}</div></div><p class="billing-form-error error" role="alert"></p><button class="primary" type="submit">ยืนยันการกำหนดแพ็กเกจ</button></form></details>`:''}</article>`;
   }).join('');
 }
 async function loadAdminBillingAccounts(){
   const root=document.getElementById('admin-billing-accounts');if(!root)return;
   const request=++adminBillingState.request;root.innerHTML='<p class="muted">กำลังโหลดบัญชีลูกค้า…</p>';
-  try{const result=await api('/admin/billing/accounts');if(request!==adminBillingState.request)return;adminBillingState.accounts=result.accounts||[];adminBillingState.plans=result.plans||[];renderAdminBillingAccounts();}
+  try{const params=new URLSearchParams({page:String(adminBillingState.page),page_size:String(adminBillingState.pageSize),status:adminBillingState.status});if(adminBillingState.search.trim())params.set('search',adminBillingState.search.trim());const result=await api('/admin/billing/accounts?'+params.toString());if(request!==adminBillingState.request)return;if(adminBillingState.page>(result.pages||1)){adminBillingState.page=result.pages||1;return loadAdminBillingAccounts();}adminBillingState.accounts=result.accounts||[];adminBillingState.plans=result.plans||[];adminBillingState.summary=result.summary||{total:result.total||0,trial:0,active:0,inactive:0};adminBillingState.total=result.total||0;adminBillingState.pages=result.pages||1;renderAdminBillingAccounts();}
   catch(error){if(request===adminBillingState.request)root.innerHTML=`<p class="error">${escapeHtml(error.message)}</p>`;}
 }
 async function loadPlatformOverview(){
@@ -160,7 +159,44 @@ async function loadAdminAuditLogs(){
     body.innerHTML=result.items.length?result.items.map(item=>`<tr><td>${new Date(item.created_at).toLocaleString('th-TH',{dateStyle:'medium',timeStyle:'short'})}</td><td>${escapeHtml(item.actor_email)}</td><td>${escapeHtml(adminAuditActionLabel(item.action,item.details))}</td><td>${escapeHtml(adminAuditTargetLabel(item))}</td></tr>`).join(''):'<tr><td colspan="4" class="members-empty">ยังไม่มีประวัติ</td></tr>';
   }catch(error){if(request!==adminAuditState.request)return;document.getElementById('admin-audit-count').textContent='โหลดประวัติไม่สำเร็จ';body.innerHTML=`<tr><td colspan="4" class="members-empty">${escapeHtml(error.message)}</td></tr>`;}
 }
-function adminAuditActionLabel(action,details={}){if(action==='platform.registration.updated')return details.registration_enabled?'เปิดรับสมัครสมาชิก':'ปิดรับสมัครสมาชิก';if(action==='user.status.updated')return details.is_active?'เปิดใช้งานบัญชีผู้ใช้':'ระงับบัญชีผู้ใช้';if(action==='user.admin.updated')return details.is_platform_admin?'กำหนดผู้ดูแลระบบ':'ถอดสิทธิ์ผู้ดูแลระบบ';if(action==='user.auditor.updated')return details.is_platform_auditor?'กำหนดผู้ตรวจสอบระบบ':'ถอดสิทธิ์ผู้ตรวจสอบระบบ';if(action==='user.updated'){const fields={full_name:'ชื่อ',email:'อีเมล',password:'รหัสผ่าน'};const changed=(details.fields||[]).map(field=>fields[field]||field);return changed.length?`แก้ไขข้อมูลผู้ใช้ · ${changed.join('、')}`:'แก้ไขข้อมูลผู้ใช้';}return ({'user.created':'สร้างบัญชีผู้ใช้','user.sessions.revoked':'ออกจากระบบทุกอุปกรณ์','user.deleted':'ลบบัญชีผู้ใช้','device.acl.retry':'ซิงก์กฎ ACL อุปกรณ์ไปยัง EMQX','billing.subscription.updated':`กำหนดแพ็กเกจ ${details.plan_code||''}`,'billing.plan.created':`สร้างแพ็กเกจ ${details.name||details.code||''}`,'billing.plan.updated':`แก้ไขแพ็กเกจ ${details.code||''}`})[action]||action;}
+function adminSupportRequestAction(details={}){
+  const method=String(details.method||'').toUpperCase();
+  const path=String(details.path||'').replace(/^\/api\/v1\/?/,'');
+  if(method==='POST'&&path==='support/session/exit')return 'ออกจากโหมดช่วยเหลือ';
+  if(method==='POST'&&/^devices\/\d+\/topics$/.test(path))return 'เพิ่มสิทธิ์ Topic ACL';
+  if(method==='DELETE'&&/^devices\/\d+\/topics\/\d+$/.test(path))return 'ลบสิทธิ์ Topic ACL';
+  if(method==='POST'&&/^devices\/\d+\/credentials\/rotate$/.test(path))return 'ออกข้อมูลรับรองอุปกรณ์ใหม่';
+  const routes=[
+    [/^auth\/me$/,'ข้อมูลบัญชี'],[/^billing\/usage$/,'แพ็กเกจและโควตา'],
+    [/^organizations\/?$/,'องค์กร'],[/^organizations\/\d+$/,'ข้อมูลองค์กร'],
+    [/^organizations\/\d+\/members$/,'สมาชิกองค์กร'],
+    [/^organizations\/\d+\/projects$/,'โปรเจ็กต์'],
+    [/^organizations\/\d+\/projects\/\d+$/,'โปรเจ็กต์'],
+    [/^organizations\/\d+\/projects\/\d+\/members$/,'สมาชิกโปรเจ็กต์'],
+    [/^organizations\/\d+\/projects\/\d+\/devices$/,'อุปกรณ์'],
+    [/^devices\/online(?:\/events)?$/,'อุปกรณ์ออนไลน์'],
+    [/^devices\/\d+$/,'อุปกรณ์'],[/^mqtt\/connection-info$/,'ข้อมูลเชื่อมต่อ MQTT'],
+    [/^support\/session$/,'สถานะโหมดช่วยเหลือ'],
+  ];
+  const resource=routes.find(([pattern])=>pattern.test(path))?.[1]||'ข้อมูลลูกค้า';
+  if(method==='GET')return `ดู${resource}`;
+  if(method==='POST')return path==='organizations'?'สร้างองค์กร':/^organizations\/\d+\/projects$/.test(path)?'สร้างโปรเจ็กต์':/^organizations\/\d+\/members$/.test(path)||/^organizations\/\d+\/projects\/\d+\/members$/.test(path)?'เพิ่มสมาชิก':/^organizations\/\d+\/projects\/\d+\/devices$/.test(path)?'เพิ่มอุปกรณ์':`เพิ่ม${resource}`;
+  if(method==='PATCH'||method==='PUT')return `แก้ไข${resource}`;
+  if(method==='DELETE')return `ลบ${resource}`;
+  return `ดำเนินการกับ${resource}`;
+}
+function adminAuditActionLabel(action,details={}){
+  if(action==='support.session.started')return `เริ่มโหมดช่วยเหลือลูกค้า · ${details.target_email||'บัญชีลูกค้า'}`;
+  if(action==='support.session.ended')return 'ออกจากโหมดช่วยเหลือลูกค้า';
+  if(action==='support.request')return `ช่วยเหลือลูกค้า · ${adminSupportRequestAction(details)}`;
+  if(action==='platform.registration.updated')return details.registration_enabled?'เปิดรับสมัครสมาชิก':'ปิดรับสมัครสมาชิก';
+  if(action==='user.status.updated')return details.is_active?'เปิดใช้งานบัญชีผู้ใช้':'ระงับบัญชีผู้ใช้';
+  if(action==='user.admin.updated')return details.is_platform_admin?'กำหนดผู้ดูแลระบบ':'ถอดสิทธิ์ผู้ดูแลระบบ';
+  if(action==='user.auditor.updated')return details.is_platform_auditor?'กำหนดผู้ตรวจสอบระบบ':'ถอดสิทธิ์ผู้ตรวจสอบระบบ';
+  if(action==='user.updated'){const fields={full_name:'ชื่อ',email:'อีเมล',password:'รหัสผ่าน'};const changed=(details.fields||[]).map(field=>fields[field]||'ข้อมูลอื่น');return changed.length?`แก้ไขข้อมูลผู้ใช้ · ${changed.join(' · ')}`:'แก้ไขข้อมูลผู้ใช้';}
+  const labels={'user.created':'สร้างบัญชีผู้ใช้','user.sessions.revoked':'ออกจากระบบทุกอุปกรณ์','user.deleted':'ลบบัญชีผู้ใช้','device.acl.retry':'ซิงก์กฎ ACL อุปกรณ์ไปยัง EMQX','billing.subscription.updated':`กำหนดแพ็กเกจ ${details.plan_code||''}`,'billing.plan.created':`สร้างแพ็กเกจ ${details.name||details.code||''}`,'billing.plan.updated':`แก้ไขแพ็กเกจ ${details.code||''}`};
+  return labels[action]||'ดำเนินการในระบบ';
+}
 function adminAuditTargetLabel(item){const labels={user:'บัญชีผู้ใช้',device:'อุปกรณ์',platform_settings:'การรับสมัครสมาชิก',billing_account:'บัญชีลูกค้า',billing_plan:'แพ็กเกจ'};return item.target_label&&item.target_label!==item.target_type?item.target_label:labels[item.target_type]||'รายการระบบ';}
 function setAdminHealth(id,label,status){
   const element=document.getElementById(id);const healthy=status==='ok';
@@ -200,8 +236,30 @@ document.getElementById('admin-global-search-results').addEventListener('click',
 });
 document.getElementById('admin-overview-refresh').addEventListener('click',()=>void loadPlatformOverview());
 document.getElementById('admin-audit-refresh').addEventListener('click',()=>void loadAdminAuditLogs());
-document.getElementById('billing-accounts-search').addEventListener('input',()=>renderAdminBillingAccounts());
-document.getElementById('billing-accounts-status').addEventListener('change',()=>renderAdminBillingAccounts());
+document.getElementById('billing-accounts-search').addEventListener('input',event=>{adminBillingState.search=event.currentTarget.value;adminBillingState.page=1;clearTimeout(adminBillingState.timer);adminBillingState.timer=setTimeout(()=>void loadAdminBillingAccounts(),250);});
+document.getElementById('billing-accounts-status').addEventListener('change',event=>{adminBillingState.status=event.currentTarget.value;adminBillingState.page=1;void loadAdminBillingAccounts();});
+document.getElementById('billing-accounts-page-size').addEventListener('change',event=>{adminBillingState.pageSize=Number(event.currentTarget.value)||20;adminBillingState.page=1;void loadAdminBillingAccounts();});
+document.getElementById('billing-accounts-prev').addEventListener('click',()=>{if(adminBillingState.page>1){adminBillingState.page--;void loadAdminBillingAccounts();}});
+document.getElementById('billing-accounts-next').addEventListener('click',()=>{if(adminBillingState.page<adminBillingState.pages){adminBillingState.page++;void loadAdminBillingAccounts();}});
+document.getElementById('admin-billing-accounts').addEventListener('click',event=>{
+  const button=event.target.closest('.billing-support-start');if(!button)return;
+  if(!currentUser?.is_platform_admin)return;
+  const form=document.getElementById('support-access-form');form.reset();form.dataset.accountId=button.dataset.accountId;
+  document.getElementById('support-access-account').textContent=`${button.dataset.accountName} · ${button.dataset.ownerEmail}`;
+  document.getElementById('support-access-error').textContent='';document.getElementById('support-access-dialog').showModal();
+});
+function closeSupportAccessDialog(){document.getElementById('support-access-dialog').close();}
+document.getElementById('support-access-close').addEventListener('click',closeSupportAccessDialog);
+document.getElementById('support-access-cancel').addEventListener('click',closeSupportAccessDialog);
+document.getElementById('support-access-form').addEventListener('submit',async event=>{
+  event.preventDefault();const form=event.currentTarget,button=form.querySelector('[type="submit"]'),error=document.getElementById('support-access-error');
+  if(!form.reportValidity())return;button.disabled=true;error.textContent='';
+  try{
+    const result=await api(`/admin/billing/accounts/${form.dataset.accountId}/support-session`,{method:'POST',body:JSON.stringify({reason:new FormData(form).get('reason')})});
+    sessionStorage.setItem(supportAdminTokenKey,token);token=result.access_token;sessionStorage.setItem(tokenKey,token);form.reset();closeSupportAccessDialog();location.hash='#overview';await startApp();
+  }catch(err){error.textContent=err.message;}
+  finally{button.disabled=false;}
+});
 document.getElementById('admin-billing-accounts').addEventListener('submit',async event=>{
   const form=event.target.closest('.admin-billing-form');if(!form)return;event.preventDefault();
   const button=form.querySelector('[type="submit"]'),error=form.querySelector('.billing-form-error'),fields=new FormData(form);

@@ -16,6 +16,10 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class SupportSessionCreate(BaseModel):
+    reason: str = Field(min_length=10, max_length=500)
+
+
 class UserView(BaseModel):
     id: int
     email: EmailStr
