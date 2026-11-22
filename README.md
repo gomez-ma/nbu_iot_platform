@@ -65,6 +65,16 @@ Organization membership is required before assigning a user to a project. Projec
 
 The Overview online-device list is paginated on the server (25 by default, configurable to 50 or 100), searchable by device name or Client ID, and filterable by organization and project.
 
+## Packages and quotas
+
+- A billing account belongs to a customer account owner and can contain multiple organizations. The first organization created by a user creates a billing account and starts a 30-day trial. Additional organizations use the same account and share its quotas.
+- Seeded plans are Trial (1 organization, 2 projects, 5 unique members, 10 devices, 20 custom Topic ACLs), Starter (1, 5, 5, 50, 100 custom Topic ACLs; annual default), Business (3, 20, 20, 500, 1,000 custom Topic ACLs; annual default), and Enterprise (custom quotas). These are configurable starter values, not a capacity guarantee for the current host.
+- Quotas count all organizations, projects, unique organization members, and registered devices under a billing account. Topic ACL quotas count user-added rules across the account; the two system-created baseline rules per device are excluded. Each device can have up to 100 user-added Topic ACLs. Project memberships do not count again after the user is already an organization member. Deleting a resource frees the corresponding quota.
+- The platform administrator assigns or changes paid plans in Platform Control → Customer Accounts and Packages. Automatic payment collection is not included.
+- Trial ends after 30 days and has a 30-day read-only grace period. When a plan expires or is suspended, read and delete operations remain available; creating organizations, projects, members, or devices is blocked. Existing MQTT connections are not disconnected automatically.
+- The platform administrator can set per-account quota overrides. A limit of `0` disallows that resource; `null` means unlimited. Existing organizations are migrated to a legacy, unlimited plan to preserve their current access.
+- API routes: `GET /api/v1/billing/plans`, `GET /api/v1/billing/usage`, `GET /api/v1/admin/billing/accounts`, and `PUT /api/v1/admin/billing/accounts/{id}/subscription`.
+
 ## Remaining platform work
 
-Email invitations/verification, password recovery, audit history, email notifications, and multi-instance event fan-out are not included yet. Account registration is open in this iteration. Before public deployment, set a strong secret, terminate TLS at a trusted proxy, add email verification and password recovery, and review registration policy.
+Email invitations/verification, password recovery, email notifications, automatic payment collection, and multi-instance event fan-out are not included yet. New billing accounts start on the trial plan; paid plans are assigned by a platform administrator. Before public deployment, set a strong secret, terminate TLS at a trusted proxy, add email verification and password recovery, and review registration policy.

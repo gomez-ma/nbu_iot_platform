@@ -20,8 +20,10 @@ from app.emqx import EMQXError, get_emqx
 from app.models import Device, DeviceTopic, Organization, OrganizationMember, Project, User
 from app.schemas import DeviceCreate, DeviceCredentialView, DeviceTopicCreate, DeviceTopicView, DeviceUpdate, DeviceView
 from app.security import decode_access_token_with_version, hash_password
+from app.billing import account_for_organization, ensure_quota
 
 router = APIRouter(prefix="/api/v1")
+MAX_CUSTOM_TOPIC_ACLS_PER_DEVICE = 100
 
 
 def require_project(db: Session, user: User, organization_id: int, project_id: int, permission: str) -> tuple[Organization, Project]:
@@ -456,6 +458,8 @@ def mqtt_connection_info(request: Request, user: User = Depends(current_user)):
 @router.post("/organizations/{organization_id}/projects/{project_id}/devices", response_model=DeviceCredentialView, status_code=201)
 def register_device(organization_id: int, project_id: int, data: DeviceCreate, db: Session = Depends(get_db), user: User = Depends(current_user)):
     organization, project = require_project(db, user, organization_id, project_id, "devices:manage")
+    account = account_for_organization(db, organization_id, lock=True)
+    ensure_quota(db, account, "max_devices")
     client_id = data.client_id or f"nbu_{project.id}_{secrets.token_hex(6)}"
     if db.scalar(select(Device.id).where(Device.client_id == client_id)):
         raise HTTPException(status_code=409, detail="Client ID is already registered")
@@ -466,8 +470,8 @@ def register_device(organization_id: int, project_id: int, data: DeviceCreate, d
     base = f"{organization.slug}/{project.slug}/{topic_name}/{client_id}/"
     device = Device(project_id=project.id, name=data.name.strip(), topic_name=topic_name, client_id=client_id, credential_hash=hash_password(password))
     device.topics = [
-        DeviceTopic(topic=base + "telemetry/#", action="publish", qos=[0, 1, 2], retain="all"),
-        DeviceTopic(topic=base + "commands/#", action="subscribe", qos=[0, 1, 2], retain="all"),
+        DeviceTopic(topic=base + "telemetry/#", action="publish", qos=[0, 1, 2], retain="all", is_system=True),
+        DeviceTopic(topic=base + "commands/#", action="subscribe", qos=[0, 1, 2], retain="all", is_system=True),
     ]
     db.add(device)
     try:
@@ -627,6 +631,18 @@ def add_device_topic(device_id: int, data: DeviceTopicCreate, db: Session = Depe
         raise HTTPException(status_code=422, detail="MQTT wildcards must occupy a complete topic level")
     if "#" in levels[:-1]:
         raise HTTPException(status_code=422, detail="The # wildcard must be the final topic level")
+    account = account_for_organization(db, device.project.organization_id, lock=True)
+    ensure_quota(db, account, "max_topic_acls")
+    device_custom_acl_count = db.scalar(select(func.count(DeviceTopic.id)).where(
+        DeviceTopic.device_id == device.id,
+        DeviceTopic.is_system.is_(False),
+    )) or 0
+    if device_custom_acl_count >= MAX_CUSTOM_TOPIC_ACLS_PER_DEVICE:
+        raise HTTPException(status_code=409, detail={
+            "code": "device_topic_acl_limit",
+            "message": f"อุปกรณ์นี้เพิ่ม Topic ACL ได้สูงสุด {MAX_CUSTOM_TOPIC_ACLS_PER_DEVICE} รายการ",
+            "limit": MAX_CUSTOM_TOPIC_ACLS_PER_DEVICE,
+        })
     topic = DeviceTopic(device_id=device.id, topic=data.topic, action=data.action, qos=data.qos, retain=data.retain)
     db.add(topic)
     try:
@@ -654,6 +670,8 @@ def delete_device_topic(device_id: int, topic_id: int, db: Session = Depends(get
     topic = db.scalar(select(DeviceTopic).where(DeviceTopic.id == topic_id, DeviceTopic.device_id == device_id))
     if topic is None:
         raise HTTPException(status_code=404, detail="Device topic rule not found")
+    if topic.is_system:
+        raise HTTPException(status_code=409, detail="ไม่สามารถลบกฎ Topic ACL พื้นฐานของระบบได้")
     db.delete(topic)
     try:
         db.flush()

@@ -20,6 +20,53 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     memberships: Mapped[list["OrganizationMember"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     project_memberships: Mapped[list["ProjectMember"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    billing_accounts: Mapped[list["BillingAccount"]] = relationship(back_populates="owner", passive_deletes=True)
+
+
+class BillingAccount(Base):
+    __tablename__ = "billing_accounts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(160))
+    owner_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    owner: Mapped[User] = relationship(back_populates="billing_accounts")
+    organizations: Mapped[list["Organization"]] = relationship(back_populates="billing_account")
+    subscription: Mapped["BillingSubscription | None"] = relationship(back_populates="billing_account", uselist=False, cascade="all, delete-orphan")
+
+
+class BillingPlan(Base):
+    __tablename__ = "billing_plans"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(100))
+    description: Mapped[str] = mapped_column(String(300), default="")
+    duration_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_organizations: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_projects: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_members: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_devices: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_topic_acls: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    is_public: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class BillingSubscription(Base):
+    __tablename__ = "billing_subscriptions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    billing_account_id: Mapped[int] = mapped_column(ForeignKey("billing_accounts.id", ondelete="CASCADE"), unique=True, index=True)
+    plan_id: Mapped[int] = mapped_column(ForeignKey("billing_plans.id"))
+    status: Mapped[str] = mapped_column(String(20), default="trial", nullable=False)
+    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    grace_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    limits_snapshot: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    quota_overrides: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    billing_account: Mapped[BillingAccount] = relationship(back_populates="subscription")
+    plan: Mapped[BillingPlan] = relationship()
 
 
 class Role(Base):
@@ -56,9 +103,11 @@ class Organization(Base):
     name: Mapped[str] = mapped_column(String(160), index=True)
     slug: Mapped[str] = mapped_column(String(180), unique=True, index=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    billing_account_id: Mapped[int] = mapped_column(ForeignKey("billing_accounts.id", ondelete="CASCADE"), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     members: Mapped[list["OrganizationMember"]] = relationship(back_populates="organization", cascade="all, delete-orphan")
     projects: Mapped[list["Project"]] = relationship(back_populates="organization", cascade="all, delete-orphan")
+    billing_account: Mapped[BillingAccount] = relationship(back_populates="organizations")
 
 
 class OrganizationMember(Base):
@@ -136,6 +185,7 @@ class DeviceTopic(Base):
     action: Mapped[str] = mapped_column(String(16))
     qos: Mapped[list[int]] = mapped_column(JSON, default=lambda: [0, 1, 2])
     retain: Mapped[str] = mapped_column(String(8), default="all")
+    is_system: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     device: Mapped[Device] = relationship(back_populates="topics")
 
 

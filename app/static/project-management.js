@@ -2,6 +2,7 @@ let managedProjectContext = null;
 const projectManagementDialog = document.querySelector('#project-management-dialog');
 const projectManagementForm = document.querySelector('#project-management-form');
 const projectManagementNotice = document.querySelector('#manage-project-notice');
+const projectDeleteButton = document.querySelector('#delete-project-button');
 
 function showProjectManagementNotice(message, type = 'error') {
   projectManagementNotice.textContent = message;
@@ -16,6 +17,7 @@ function openProjectManagement(organization, project) {
   projectManagementForm.elements.slug.dataset.edited = '';
   projectManagementForm.elements.description.value = project.description || '';
   projectManagementNotice.className = 'members-notice hidden';
+  projectDeleteButton.classList.remove('hidden');
   document.querySelector('#manage-project-org').textContent = organization.name + ' / ' + project.slug;
   projectManagementDialog.showModal();
 }
@@ -48,19 +50,22 @@ projectManagementForm.addEventListener('submit', async (event) => {
   } finally { submit.disabled = false; }
 });
 
-document.querySelector('#delete-project-button').addEventListener('click', async (event) => {
+projectDeleteButton.addEventListener('click', async () => {
   if (!managedProjectContext) return;
+  const confirmed = await confirmApp(
+    'ลบโปรเจ็กต์ "' + managedProjectContext.project.name + '" พร้อมสมาชิก อุปกรณ์ และ MQTT credentials/ACL หรือไม่? การลบนี้ไม่สามารถย้อนกลับได้',
+    { title: 'ยืนยันลบโปรเจ็กต์', confirmLabel: 'ลบโปรเจ็กต์', danger: true },
+  );
+  if (!confirmed) return;
   const { organization, project } = managedProjectContext;
-  if (!await confirmApp('ลบโปรเจ็กต์ "' + project.name + '" พร้อมสมาชิก อุปกรณ์ MQTT credentials และ ACL ทั้งหมดหรือไม่? การลบนี้ย้อนกลับไม่ได้',{title:'ลบโปรเจ็กต์',confirmLabel:'ลบโปรเจ็กต์',danger:true})) return;
-  const button = event.currentTarget;
-  button.disabled = true;
+  projectDeleteButton.disabled = true;
   try {
     await api('/organizations/' + organization.id + '/projects/' + project.id, { method: 'DELETE' });
     projectManagementDialog.close();
     await loadOrganizations();
   } catch (error) {
     showProjectManagementNotice(error.message);
-  } finally { button.disabled = false; }
+  } finally { projectDeleteButton.disabled = false; }
 });
 
 document.querySelector('#manage-project-close').addEventListener('click', () => projectManagementDialog.close());

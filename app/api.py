@@ -1,16 +1,19 @@
+from datetime import datetime, timedelta, timezone
+
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.database import get_db
 from app.config import get_settings
 from app.emqx import EMQXError, get_emqx
-from app.models import AdminAuditLog, Device, Organization, OrganizationMember, Permission, PlatformSettings, Project, ProjectMember, Role, User
+from app.models import AdminAuditLog, BillingAccount, BillingPlan, BillingSubscription, Device, Organization, OrganizationMember, Permission, PlatformSettings, Project, ProjectMember, Role, User
 from app.device_presence import heartbeat_state
-from app.schemas import AddMember, AddProjectMember, LoginRequest, MemberView, OrganizationCreate, OrganizationUpdate, OrganizationView, PasswordChange, PlatformAdminUpdate, PlatformAuditorUpdate, PlatformSettingsUpdate, PlatformUserCreate, PlatformUserUpdate, PlatformUserView, PlatformUsersPage, ProfileUpdate, ProjectCreate, ProjectMemberView, ProjectMembersView, ProjectUpdate, ProjectView, TokenView, UpdateMemberRole, UpdateProjectMemberRole, UserActivationUpdate, UserCreate, UserView
+from app.schemas import AddMember, AddProjectMember, BillingPlanCreate, BillingPlanUpdate, BillingSubscriptionUpdate, LoginRequest, MemberView, OrganizationCreate, OrganizationUpdate, OrganizationView, PasswordChange, PlatformAdminUpdate, PlatformAuditorUpdate, PlatformSettingsUpdate, PlatformUserCreate, PlatformUserUpdate, PlatformUserView, PlatformUsersPage, ProfileUpdate, ProjectCreate, ProjectMemberView, ProjectMembersView, ProjectUpdate, ProjectView, TokenView, UpdateMemberRole, UpdateProjectMemberRole, UserActivationUpdate, UserCreate, UserView
 from app.security import create_access_token, decode_access_token_with_version, hash_password, verify_password
+from app.billing import account_for_organization, ensure_quota, get_or_create_owner_account, get_subscription, subscription_payload
 
 router = APIRouter(prefix="/api/v1")
 bearer = HTTPBearer(auto_error=False)
@@ -400,6 +403,136 @@ def update_platform_settings(data: PlatformSettingsUpdate, db: Session = Depends
     return {"registration_enabled": settings.registration_enabled}
 
 
+@router.get("/billing/plans")
+def list_public_billing_plans(db: Session = Depends(get_db)):
+    plans = db.scalars(select(BillingPlan).where(BillingPlan.is_active.is_(True), BillingPlan.is_public.is_(True)).order_by(BillingPlan.id)).all()
+    return [{
+        "code": plan.code, "name": plan.name, "description": plan.description,
+        "duration_days": plan.duration_days, "max_organizations": plan.max_organizations,
+        "max_projects": plan.max_projects, "max_members": plan.max_members,
+        "max_devices": plan.max_devices, "max_topic_acls": plan.max_topic_acls,
+    } for plan in plans]
+
+
+def billing_plan_payload(plan: BillingPlan) -> dict:
+    return {"id": plan.id, "code": plan.code, "name": plan.name, "description": plan.description,
+            "duration_days": plan.duration_days, "max_organizations": plan.max_organizations,
+            "max_projects": plan.max_projects, "max_members": plan.max_members,
+            "max_devices": plan.max_devices, "max_topic_acls": plan.max_topic_acls,
+            "is_public": plan.is_public, "is_active": plan.is_active}
+
+
+@router.get("/admin/billing/plans")
+def list_billing_plans(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    require_platform_admin(user)
+    plans = db.scalars(select(BillingPlan).where(BillingPlan.code != "legacy").order_by(BillingPlan.id)).all()
+    return {"plans": [billing_plan_payload(plan) for plan in plans]}
+
+
+@router.post("/admin/billing/plans", status_code=201)
+def create_billing_plan(data: BillingPlanCreate, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    require_platform_admin(user)
+    if data.code == "legacy":
+        raise HTTPException(status_code=422, detail="รหัสแพ็กเกจนี้สงวนไว้")
+    plan = BillingPlan(**data.model_dump())
+    db.add(plan)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="รหัสแพ็กเกจนี้มีอยู่แล้ว") from exc
+    add_admin_audit(db, user, "billing.plan.created", "billing_plan", plan.id, {"code": plan.code, "name": plan.name})
+    db.commit()
+    db.refresh(plan)
+    return billing_plan_payload(plan)
+
+
+@router.patch("/admin/billing/plans/{plan_code}")
+def update_billing_plan(plan_code: str, data: BillingPlanUpdate, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    require_platform_admin(user)
+    plan = db.scalar(select(BillingPlan).where(BillingPlan.code == plan_code).with_for_update())
+    if plan is None or plan.code == "legacy":
+        raise HTTPException(status_code=404, detail="ไม่พบแพ็กเกจ")
+    changes = data.model_dump(exclude_unset=True)
+    if plan.code == "trial" and changes.get("is_active") is False:
+        raise HTTPException(status_code=409, detail="ไม่สามารถปิดแพ็กเกจทดลองได้ เพราะใช้กำหนดแพ็กเกจเริ่มต้นให้บัญชีใหม่")
+    for field, value in changes.items():
+        setattr(plan, field, value)
+    add_admin_audit(db, user, "billing.plan.updated", "billing_plan", plan.id, {"code": plan.code, "fields": list(changes)})
+    db.commit()
+    db.refresh(plan)
+    return billing_plan_payload(plan)
+
+
+@router.get("/billing/usage")
+def get_my_billing_usage(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    accounts = db.scalars(select(BillingAccount).where(BillingAccount.owner_user_id == user.id).order_by(BillingAccount.id)).all()
+    return {"accounts": [subscription_payload(db, account) for account in accounts]}
+
+
+@router.get("/admin/billing/accounts")
+def list_billing_accounts(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    require_platform_reader(user)
+    accounts = db.scalars(
+        select(BillingAccount)
+        .options(selectinload(BillingAccount.owner), selectinload(BillingAccount.subscription).selectinload(BillingSubscription.plan))
+        .order_by(BillingAccount.created_at.desc(), BillingAccount.id.desc())
+    ).all()
+    results = []
+    for account in accounts:
+        if account.subscription is None:
+            subscription = None
+        else:
+            subscription = subscription_payload(db, account)
+        results.append({
+            "id": account.id, "name": account.name,
+            "owner_user_id": account.owner_user_id,
+            "owner_name": account.owner.full_name, "owner_email": account.owner.email,
+            "created_at": account.created_at, "subscription": subscription,
+        })
+    plans = db.scalars(select(BillingPlan).where(BillingPlan.is_active.is_(True), BillingPlan.code != "legacy").order_by(BillingPlan.id)).all()
+    return {"accounts": results, "plans": [{"code": p.code, "name": p.name, "description": p.description, "duration_days": p.duration_days, "max_organizations": p.max_organizations, "max_projects": p.max_projects, "max_members": p.max_members, "max_devices": p.max_devices, "max_topic_acls": p.max_topic_acls} for p in plans]}
+
+
+@router.put("/admin/billing/accounts/{account_id}/subscription")
+def assign_billing_subscription(account_id: int, data: BillingSubscriptionUpdate, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    require_platform_admin(user)
+    account = db.scalar(select(BillingAccount).where(BillingAccount.id == account_id).with_for_update())
+    if account is None:
+        raise HTTPException(status_code=404, detail="ไม่พบบัญชีลูกค้า")
+    plan = db.scalar(select(BillingPlan).where(BillingPlan.code == data.plan_code, BillingPlan.is_active.is_(True), BillingPlan.code != "legacy"))
+    if plan is None:
+        raise HTTPException(status_code=404, detail="ไม่พบแพ็กเกจที่เปิดใช้งาน")
+    quota_fields = ("max_organizations", "max_projects", "max_members", "max_devices", "max_topic_acls")
+    if plan.code == "enterprise" and set(data.quota_overrides) != set(quota_fields):
+        raise HTTPException(status_code=422, detail="แพ็กเกจองค์กรต้องกำหนดโควตาทั้ง 5 รายการก่อนบันทึก (ใส่ 0 หากไม่อนุญาต หรือปล่อย null เมื่อตั้งใจให้ไม่จำกัด)")
+    now = datetime.now(timezone.utc)
+    duration_days = data.duration_days if data.duration_days is not None else plan.duration_days
+    ends_at = now + timedelta(days=duration_days) if duration_days is not None else None
+    grace_until = ends_at + timedelta(days=data.grace_days) if ends_at is not None else None
+    status = data.status or ("trial" if plan.code == "trial" else "active")
+    limits_snapshot = {field: getattr(plan, field) for field in quota_fields}
+    subscription = db.scalar(select(BillingSubscription).where(BillingSubscription.billing_account_id == account.id).with_for_update())
+    if subscription is None:
+        subscription = BillingSubscription(billing_account_id=account.id, plan_id=plan.id, status=status, starts_at=now, ends_at=ends_at, grace_until=grace_until, limits_snapshot=limits_snapshot, quota_overrides=data.quota_overrides)
+        db.add(subscription)
+    else:
+        subscription.plan_id = plan.id
+        subscription.status = status
+        subscription.starts_at = now
+        subscription.ends_at = ends_at
+        subscription.grace_until = grace_until
+        subscription.limits_snapshot = limits_snapshot
+        subscription.quota_overrides = data.quota_overrides
+    add_admin_audit(db, user, "billing.subscription.updated", "billing_account", account.id, {
+        "plan_code": plan.code, "status": status, "duration_days": duration_days,
+        "grace_days": data.grace_days, "quota_overrides": data.quota_overrides,
+    })
+    db.commit()
+    db.refresh(account)
+    return subscription_payload(db, account)
+
+
 @router.get("/admin/audit-logs")
 def list_admin_audit_logs(limit: int = 50, offset: int = 0, db: Session = Depends(get_db), user: User = Depends(current_user)):
     require_platform_reader(user)
@@ -409,11 +542,14 @@ def list_admin_audit_logs(limit: int = 50, offset: int = 0, db: Session = Depend
     entries = db.scalars(select(AdminAuditLog).order_by(AdminAuditLog.created_at.desc(), AdminAuditLog.id.desc()).offset(offset).limit(limit)).all()
     user_ids = {int(item.target_id) for item in entries if item.target_type == "user" and item.target_id and item.target_id.isdigit()}
     device_ids = {int(item.target_id) for item in entries if item.target_type == "device" and item.target_id and item.target_id.isdigit()}
+    plan_ids = {int(item.target_id) for item in entries if item.target_type == "billing_plan" and item.target_id and item.target_id.isdigit()}
     users_by_id = {item.id: item for item in db.scalars(select(User).where(User.id.in_(user_ids))).all()} if user_ids else {}
     devices_by_id = {item.id: item for item in db.scalars(select(Device).where(Device.id.in_(device_ids))).all()} if device_ids else {}
+    plans_by_id = {item.id: item for item in db.scalars(select(BillingPlan).where(BillingPlan.id.in_(plan_ids))).all()} if plan_ids else {}
     target_labels = {"platform_settings:1": "การรับสมัครสมาชิก"}
     target_labels.update({f"user:{item.id}": f"บัญชีผู้ใช้: {item.full_name} · {item.email}" for item in users_by_id.values()})
     target_labels.update({f"device:{item.id}": f"อุปกรณ์: {item.name} · {item.client_id}" for item in devices_by_id.values()})
+    target_labels.update({f"billing_plan:{item.id}": f"แพ็กเกจ: {item.name} · {item.code}" for item in plans_by_id.values()})
     items = []
     for item in entries:
         target_label = target_labels.get(f"{item.target_type}:{item.target_id}")
@@ -578,6 +714,19 @@ def delete_platform_user(user_id: int, db: Session = Depends(get_db), user: User
             raise HTTPException(status_code=409, detail=f"บัญชีนี้เป็นเจ้าขององค์กร {membership.organization.name} เพียงคนเดียว กรุณาเพิ่มสมาชิกหรือจัดการองค์กรก่อนลบบัญชี")
         successor = next((member for member in other_members if member.role.name == "organization_admin"), other_members[0])
         successor.role_id = owner_role.id
+    for account in db.scalars(select(BillingAccount).where(BillingAccount.owner_user_id == target.id)).all():
+        successor_id = db.scalar(
+            select(OrganizationMember.user_id)
+            .join(Organization, Organization.id == OrganizationMember.organization_id)
+            .join(Role, Role.id == OrganizationMember.role_id)
+            .where(Organization.billing_account_id == account.id, OrganizationMember.user_id != target.id)
+            .order_by(case((Role.name == "owner", 0), (Role.name == "organization_admin", 1), else_=2), OrganizationMember.user_id)
+            .limit(1)
+        )
+        if successor_id is not None:
+            account.owner_user_id = successor_id
+        elif db.scalar(select(func.count()).select_from(Organization).where(Organization.billing_account_id == account.id)):
+            raise HTTPException(status_code=409, detail=f"ไม่สามารถโอนบัญชีแพ็กเกจ {account.name} ให้สมาชิกคนอื่นได้ กรุณาเพิ่มสมาชิกก่อนลบบัญชีนี้")
     # Keep projects intact while removing their creator foreign-key dependency.
     add_admin_audit(db, user, "user.deleted", "user", target.id, {"email": target.email})
     db.execute(update(Project).where(Project.created_by == target.id).values(created_by=user.id))
@@ -603,9 +752,19 @@ def create_organization(data: OrganizationCreate, db: Session = Depends(get_db),
     if owner_role is None:
         seed_rbac(db)
         owner_role = db.scalar(select(Role).where(Role.name == "owner", Role.scope == "organization"))
-    organization = Organization(name=data.name.strip(), slug=data.slug, description=data.description)
-    db.add(organization)
     try:
+        account = get_or_create_owner_account(db, user, data.name)
+        ensure_quota(db, account, "max_organizations")
+        already_account_member = db.scalar(
+            select(OrganizationMember.organization_id)
+            .join(Organization, Organization.id == OrganizationMember.organization_id)
+            .where(Organization.billing_account_id == account.id, OrganizationMember.user_id == user.id)
+            .limit(1)
+        ) is not None
+        if not already_account_member:
+            ensure_quota(db, account, "max_members")
+        organization = Organization(name=data.name.strip(), slug=data.slug, description=data.description, billing_account_id=account.id)
+        db.add(organization)
         db.flush()
         db.add(OrganizationMember(organization_id=organization.id, user_id=user.id, role_id=owner_role.id))
         db.commit()
@@ -672,6 +831,15 @@ def add_member(organization_id: int, data: AddMember, db: Session = Depends(get_
         raise HTTPException(status_code=404, detail="Create the user account before adding them to an organization")
     if db.get(OrganizationMember, (organization_id, target.id)):
         raise HTTPException(status_code=409, detail="User is already an organization member")
+    account = account_for_organization(db, organization_id, lock=True)
+    already_account_member = db.scalar(
+        select(OrganizationMember.organization_id)
+        .join(Organization, Organization.id == OrganizationMember.organization_id)
+        .where(Organization.billing_account_id == account.id, OrganizationMember.user_id == target.id)
+        .limit(1)
+    ) is not None
+    if not already_account_member:
+        ensure_quota(db, account, "max_members")
     role = db.scalar(select(Role).where(Role.name == data.role, Role.scope == "organization"))
     membership = OrganizationMember(organization_id=organization_id, user_id=target.id, role_id=role.id)
     db.add(membership)
@@ -754,6 +922,8 @@ def list_projects(organization_id: int, db: Session = Depends(get_db), user: Use
 @router.post("/organizations/{organization_id}/projects", response_model=ProjectView, status_code=201)
 def create_project(organization_id: int, data: ProjectCreate, db: Session = Depends(get_db), user: User = Depends(current_user)):
     require_org(db, user, organization_id, "projects:manage")
+    account = account_for_organization(db, organization_id, lock=True)
+    ensure_quota(db, account, "max_projects")
     owner_role = db.scalar(select(Role).where(Role.name == "project_owner", Role.scope == "project"))
     project = Project(organization_id=organization_id, name=data.name.strip(), slug=data.slug, description=data.description, created_by=user.id)
     db.add(project)
@@ -835,7 +1005,7 @@ def add_project_member(organization_id: int, project_id: int, data: AddProjectMe
     if target is None:
         raise HTTPException(status_code=404, detail="Create the user account and add them to this organization first")
     if db.get(OrganizationMember, (organization_id, target.id)) is None:
-        raise HTTPException(status_code=400, detail="Add this user to the organization before assigning the project")
+        raise HTTPException(status_code=400, detail="กรุณาเพิ่มผู้ใช้นี้เป็นสมาชิกองค์กรก่อน จึงจะกำหนดให้เข้าร่วมโปรเจ็กต์ได้")
     if db.get(ProjectMember, (project_id, target.id)):
         raise HTTPException(status_code=409, detail="User is already assigned to this project")
     role = db.scalar(select(Role).where(Role.name == data.role, Role.scope == "project"))

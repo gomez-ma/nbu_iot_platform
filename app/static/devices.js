@@ -6,6 +6,7 @@ const escapeDeviceHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (cha
 const copyIconMarkup = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>';
 const checkIconMarkup = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>';
 const deviceTopicNameFromDisplay = (name, fallback) => name.replace(/[^A-Za-z0-9_-]+/g, '_').replace(/^[_-]+|[_-]+$/g, '').slice(0, 80) || fallback.slice(0, 80);
+const maxCustomTopicAclsPerDevice = 100;
 
 async function deviceRequest(path, options = {}) {
   const token = sessionStorage.getItem(deviceTokenKey);
@@ -15,7 +16,7 @@ async function deviceRequest(path, options = {}) {
   });
   if (response.status === 204) return null;
   const data = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(data?.detail || 'ทำรายการไม่สำเร็จ');
+  if (!response.ok) throw new Error(typeof data?.detail === 'string' ? data.detail : data?.detail?.message || 'ทำรายการไม่สำเร็จ');
   return data;
 }
 
@@ -219,9 +220,10 @@ function renderDeviceDetail() {
   const mqttModePort = hasLiveConnectionMode ? Number(device.last_connection_port) : Number(selectedMode?.port || (hasKnownConnectionMode ? device.last_connection_port : mqttInfo.plain_port || 1883));
   const plainModePort = !mqttModeTls ? mqttModePort : Number(mqttInfo.plain_port || 1883);
   const tlsModePort = mqttModeTls ? mqttModePort : Number(mqttInfo.tls_port || 8883);
+  const customTopicAclCount = device.topics.filter((rule) => !rule.is_system).length;
   const topics = device.topics.map((rule) => {
     const actionLabel = ({ publish: 'ส่งข้อมูล · Publish', subscribe: 'รับข้อมูล · Subscribe', all: 'ส่งและรับ · Publish & Subscribe' })[rule.action] || rule.action;
-    return '<tr><td><span class="action-tag ' + escapeDeviceHtml(rule.action) + '">' + escapeDeviceHtml(actionLabel) + '</span></td><td><code>' + escapeDeviceHtml(rule.topic) + '</code><small>QoS ' + escapeDeviceHtml(rule.qos.join(', ')) + ' · Retain ' + escapeDeviceHtml(rule.retain) + '</small></td><td><div class="topic-row-actions"><button type="button" class="secondary copy-icon-button" data-copy-topic="' + escapeDeviceHtml(rule.topic) + '" aria-label="คัดลอก Topic" title="คัดลอก Topic">' + copyIconMarkup + '</button><button type="button" class="icon-danger" data-remove-topic="' + rule.id + '" aria-label="ลบ ACL" title="ลบ ACL">×</button></div></td></tr>';
+    return '<tr><td><span class="action-tag ' + escapeDeviceHtml(rule.action) + '">' + escapeDeviceHtml(actionLabel) + '</span></td><td><code>' + escapeDeviceHtml(rule.topic) + '</code><small>QoS ' + escapeDeviceHtml(rule.qos.join(', ')) + ' · Retain ' + escapeDeviceHtml(rule.retain) + (rule.is_system ? ' · กฎพื้นฐาน' : '') + '</small></td><td><div class="topic-row-actions"><button type="button" class="secondary copy-icon-button" data-copy-topic="' + escapeDeviceHtml(rule.topic) + '" aria-label="คัดลอก Topic" title="คัดลอก Topic">' + copyIconMarkup + '</button>' + (rule.is_system ? '' : '<button type="button" class="icon-danger" data-remove-topic="' + rule.id + '" aria-label="ลบ ACL" title="ลบ ACL">×</button>') + '</div></td></tr>';
   }).join('');
   panel.innerHTML = '<div class="device-detail-head"><div><span class="eyebrow">DEVICE DETAILS</span><h3>' + escapeDeviceHtml(device.name) + '</h3></div></div>' +
     '<section id="device-live-summary" class="device-live-summary"><div class="presence-summary-item"><small>MQTT Session</small><span class="device-status ' + escapeDeviceHtml(device.status) + '" data-device-status><i></i>' + statusLabel(device.status) + '</span><span class="presence-detail"><span data-connection-port-label>' + (device.status === 'online' ? 'พอร์ตที่ใช้งาน' : 'พอร์ตที่ใช้ล่าสุด') + '</span><b data-connection-port>' + connectionPortLabel(device) + '</b></span></div><div class="presence-summary-item"><small>Heartbeat</small><span class="heartbeat-chip ' + escapeDeviceHtml(device.heartbeat_status || 'waiting') + '" data-heartbeat-status><i></i>' + heartbeatLabel(device.heartbeat_status) + '</span><span class="presence-detail">ล่าสุด <b data-heartbeat-time>' + (device.last_heartbeat_at ? formatDeviceDate(device.last_heartbeat_at) : 'ยังไม่เคยได้รับ heartbeat') + '</b></span></div><div class="presence-summary-item"><small>พบอุปกรณ์ล่าสุด</small><strong data-last-seen>' + (device.last_seen_at ? formatDeviceDate(device.last_seen_at) : 'ยังไม่มีข้อมูล') + '</strong></div></section>' +
@@ -238,9 +240,9 @@ function renderDeviceDetail() {
     (!mqttInfo.host_is_configured ? '<p class="mqtt-config-note">Broker Host แสดงตามที่อยู่หน้าเว็บ หากอุปกรณ์อยู่อีกเครื่อง ให้ตั้งค่า <code>EMQX_MQTT_PUBLIC_HOST</code> เป็น IP/โดเมนที่อุปกรณ์เข้าถึงได้</p>' : '') +
     '<div class="mqtt-password-note"><span class="mqtt-password-icon">i</span><p><strong>Password</strong> แสดงครั้งเดียวตอนลงทะเบียนหรือเปลี่ยนรหัสผ่าน หากไม่มีรหัสผ่าน ให้ใช้ปุ่ม “เปลี่ยนรหัสผ่าน” ด้านล่างแล้วบันทึกค่าใหม่ไว้</p></div>' +
     '<div class="mqtt-recommended-settings"><span>ค่าแนะนำ</span><b>Keep Alive ' + escapeDeviceHtml(mqttInfo.keepalive_seconds_recommended || 60) + ' วินาที</b><i>Session: Clean Session; ใช้ Persistent Session + QoS 1 หากต้องรับคำสั่งระหว่างออฟไลน์</i><i>ใช้ Client ID เดิมของอุปกรณ์นี้ทุกครั้งที่ reconnect</i></div></section>' +
-    '<section class="topic-manager"><header class="topic-manager-heading"><span class="topic-manager-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3 20 6v5c0 5-3.4 8.2-8 10-4.6-1.8-8-5-8-10V6l8-3Z"/><path d="m8.5 12 2.2 2.2 4.8-4.8"/></svg></span><div><h4>Topic ACL</h4><p>สิทธิ์ส่งและรับข้อมูลของอุปกรณ์ในโปรเจกต์นี้</p></div></header><div class="topic-prefix"><div class="topic-prefix-copy"><small>Topic prefix ของอุปกรณ์นี้</small><code>' + escapeDeviceHtml(topicPrefix) + '</code></div><button type="button" class="secondary copy-icon-button" data-copy-value="' + escapeDeviceHtml(topicPrefix) + '" aria-label="คัดลอก Topic prefix" title="คัดลอก Topic prefix">' + copyIconMarkup + '</button></div>' +
+    '<section class="topic-manager"><header class="topic-manager-heading"><span class="topic-manager-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3 20 6v5c0 5-3.4 8.2-8 10-4.6-1.8-8-5-8-10V6l8-3Z"/><path d="m8.5 12 2.2 2.2 4.8-4.8"/></svg></span><div><h4>Topic ACL</h4><p>กฎพื้นฐานไม่นับโควตา · เพิ่มเอง ${customTopicAclCount}/${maxCustomTopicAclsPerDevice} ต่ออุปกรณ์ (มีโควตารวมตามแพ็กเกจ)</p></div></header><div class="topic-prefix"><div class="topic-prefix-copy"><small>Topic prefix ของอุปกรณ์นี้</small><code>' + escapeDeviceHtml(topicPrefix) + '</code></div><button type="button" class="secondary copy-icon-button" data-copy-value="' + escapeDeviceHtml(topicPrefix) + '" aria-label="คัดลอก Topic prefix" title="คัดลอก Topic prefix">' + copyIconMarkup + '</button></div>' +
     '<div class="topic-table-wrap"><table class="topic-table"><thead><tr><th>สิทธิ์</th><th>Topic filter</th><th></th></tr></thead><tbody>' + (topics || '<tr><td colspan="3" class="device-no-results">ยังไม่มีกฎ ACL — อุปกรณ์ถูกปฏิเสธ topic ทั้งหมด</td></tr>') + '</tbody></table></div>' +
-    '<form id="device-topic-form" class="topic-create-form"><label>สิทธิ์<select name="action"><option value="publish">ส่งข้อมูล · Publish</option><option value="subscribe">รับข้อมูล · Subscribe</option><option value="all">ส่งและรับข้อมูล · Publish &amp; Subscribe</option></select></label><label class="topic-input-label">Topic filter<input name="topic" required maxlength="512" placeholder="' + escapeDeviceHtml(projectDevicesPrefix + '{device_topic_name}/{client_id}/custom/#') + '"></label><button class="primary" type="submit">เพิ่ม ACL</button></form></section>' +
+    '<form id="device-topic-form" class="topic-create-form"><label>สิทธิ์<select name="action"><option value="publish">ส่งข้อมูล · Publish</option><option value="subscribe">รับข้อมูล · Subscribe</option><option value="all">ส่งและรับข้อมูล · Publish &amp; Subscribe</option></select></label><label class="topic-input-label">Topic filter<input name="topic" required maxlength="512" placeholder="' + escapeDeviceHtml(projectDevicesPrefix + '{device_topic_name}/{client_id}/custom/#') + '"></label><button class="primary" type="submit" ' + (customTopicAclCount >= maxCustomTopicAclsPerDevice ? 'disabled' : '') + '>เพิ่ม ACL</button></form></section>' +
     '<section class="device-manage-card"><header><div><h4>จัดการอุปกรณ์</h4><p>เปลี่ยน credential หรือเอาอุปกรณ์ออกจากโปรเจกต์</p></div></header><div class="device-actions"><button type="button" class="secondary" data-rotate-credentials>↻ เปลี่ยนรหัสผ่าน</button><button type="button" class="danger-button" data-delete-device>ลบอุปกรณ์</button></div></section>';
   panel.querySelector('#device-name-form').addEventListener('submit', updateDeviceName);
   panel.querySelector('#device-topic-form').addEventListener('submit', addDeviceTopic);
@@ -399,6 +401,7 @@ async function createDevice(event) {
     deviceState.selectedId = result.device.id;
     renderDeviceList();
     renderDeviceDetail();
+    if (typeof loadBillingUsage === 'function') await loadBillingUsage();
   } catch (error) {
     deviceNotice(error.message);
   } finally {
@@ -437,6 +440,7 @@ async function addDeviceTopic(event) {
     await deviceRequest('/devices/' + device.id + '/topics', { method: 'POST', body: JSON.stringify({ topic: fields.get('topic'), action: fields.get('action') }) });
     deviceNotice('เพิ่ม topic ACL แล้ว', 'success');
     await refreshProjectDevices();
+    if (typeof loadBillingUsage === 'function') await loadBillingUsage();
   } catch (error) { deviceNotice(error.message); }
   finally { submit.disabled = false; }
 }
@@ -460,6 +464,7 @@ async function removeDevice() {
     deviceState.selectedId = null;
     deviceNotice('ลบอุปกรณ์แล้ว', 'success');
     await refreshProjectDevices({ keepSelection: false });
+    if (typeof loadBillingUsage === 'function') await loadBillingUsage();
   } catch (error) { deviceNotice(error.message); }
 }
 
@@ -471,6 +476,7 @@ async function removeDeviceTopic(topicId) {
     await deviceRequest('/devices/' + device.id + '/topics/' + topic.id, { method: 'DELETE' });
     deviceNotice('ลบ topic ACL แล้ว', 'success');
     await refreshProjectDevices();
+    if (typeof loadBillingUsage === 'function') await loadBillingUsage();
   } catch (error) { deviceNotice(error.message); }
 }
 
@@ -542,6 +548,7 @@ deviceQuery('#device-dialog').addEventListener('close', () => {
   clearTimeout(deviceState.heartbeatStaleTimer);
   deviceState.heartbeatStaleTimer = null;
   hideCredential();
+  if (typeof loadBillingUsage === 'function') void loadBillingUsage();
 });
 deviceQuery('#device-detail').addEventListener('click', (event) => {
   if (event.target.closest('[data-rotate-credentials]')) rotateDeviceCredentials();

@@ -10,6 +10,7 @@ from sqlalchemy.orm import selectinload
 
 from app import models  # noqa: F401
 from app.api import router, seed_rbac
+from app.billing import seed_billing_plans
 from app.config import get_settings
 from app.database import SessionLocal
 from app.device_api import ensure_device_monitoring, router as device_router
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(_: FastAPI):
     with SessionLocal() as db:
         seed_rbac(db)
+        seed_billing_plans(db)
         devices = db.scalars(select(Device).options(selectinload(Device.topics))).all()
         device_rules = [
             (device.client_id, [
