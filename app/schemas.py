@@ -9,6 +9,7 @@ class UserCreate(BaseModel):
     email: EmailStr
     full_name: str = Field(min_length=2, max_length=160)
     password: str = Field(min_length=10, max_length=128)
+    requested_plan_code: str | None = Field(default=None, min_length=2, max_length=40, pattern=r"^[a-z0-9][a-z0-9_-]*$")
 
 
 class LoginRequest(BaseModel):
@@ -36,6 +37,8 @@ class PlatformUserView(BaseModel):
     is_active: bool
     is_platform_admin: bool
     is_platform_auditor: bool = False
+    requested_plan_code: str | None = None
+    requested_plan_name: str | None = None
     created_at: datetime
     model_config = ConfigDict(from_attributes=True)
 

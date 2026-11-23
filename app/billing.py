@@ -68,6 +68,23 @@ def get_or_create_owner_account(db: Session, user: User, account_name: str) -> B
     return account
 
 
+def provision_accounts_for_approved_plan_requests(db: Session) -> int:
+    users = db.scalars(
+        select(User).where(
+            User.is_active.is_(True),
+            User.is_platform_admin.is_(False),
+            User.is_platform_auditor.is_(False),
+            User.requested_plan_code.is_not(None),
+            ~User.billing_accounts.any(),
+        )
+    ).all()
+    for user in users:
+        get_or_create_owner_account(db, user, f"บัญชีลูกค้า · {user.full_name}")
+    if users:
+        db.commit()
+    return len(users)
+
+
 def account_for_organization(db: Session, organization_id: int, *, lock: bool = False) -> BillingAccount:
     query = select(BillingAccount).join(Organization, Organization.billing_account_id == BillingAccount.id).where(Organization.id == organization_id)
     if lock:
